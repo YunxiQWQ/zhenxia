@@ -34,6 +34,7 @@ interface ClipListProps {
   selectOnHover?: boolean;
   /** Multi-select is available (History window only). */
   selectable?: boolean;
+  selectionControlsVisible?: boolean;
   /** Ids currently in the multi-select set. */
   checkedIds?: ReadonlySet<string>;
   /** Toggle multi-selection for a row, given its index for shift-extend. */
@@ -65,6 +66,7 @@ export function ClipList({
   onToggleReveal,
   selectOnHover = true,
   selectable = false,
+  selectionControlsVisible = selectable,
   checkedIds,
   onToggleSelect,
   keyboardNavigation = false,
@@ -205,6 +207,7 @@ export function ClipList({
             revealed={revealedClips?.get(clip.id)}
             onToggleReveal={onToggleReveal ? () => onToggleReveal(clip.id) : undefined}
             selectable={selectable}
+            selectionControlsVisible={selectionControlsVisible}
             isChecked={checkedIds?.has(clip.id) ?? false}
             onToggleSelect={(event) => onToggleSelect?.(clip.id, index, event)}
           />

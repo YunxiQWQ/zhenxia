@@ -5,16 +5,12 @@ import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   Camera,
-  CheckSquare,
+  ArrowLeft,
   ClipboardPaste,
   Copy,
   History,
-  Pencil,
   Pin,
   PinOff,
-  Plus,
-  Search,
-  Settings2,
   Trash2,
   X,
 } from 'lucide-react';
@@ -25,7 +21,8 @@ import { ClipPreview } from '../components/ClipPreview';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { FolderModal } from '../components/FolderModal';
 import { WelcomeOverlay } from '../components/WelcomeOverlay';
-import { ContentFilter } from '../components/FlyoutHeader';
+import { ContentFilter, FlyoutHeader } from '../components/FlyoutHeader';
+import { ContextMenu } from '../components/ContextMenu';
 import { useTheme } from '../hooks/useTheme';
 import { windowMaterial } from '../utils/windowMaterial';
 import { useSystemAccent } from '../hooks/useSystemAccent';
@@ -66,12 +63,6 @@ const bulkActionClass =
 const filterSelectClass =
   'h-9 max-w-[168px] shrink-0 rounded-md border border-white/[0.08] bg-transparent px-2 text-xs text-muted-foreground outline-none hover:text-foreground';
 
-const CONTENT_FILTERS: ReadonlyArray<readonly [ContentFilter, string]> = [
-  ['all', 'All'],
-  ['text', 'Text'],
-  ['images', 'Images'],
-];
-
 /**
  * Unified clipboard history in the original main window. Win+V and the tray
  * open this same mounted surface, sharing filters, selection and drafts.
@@ -100,6 +91,15 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
   const [showWelcome, setShowWelcome] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [multiSelectMode, setMultiSelectMode] = useState(false);
+  const [menu, setMenu] = useState<{ x: number; y: number; clipId?: string } | null>(null);
+  const [clearRequest, setClearRequest] = useState<'unpinned' | 'all' | null>(null);
+  const [clearing, setClearing] = useState(false);
+  useEffect(() => {
+    if (!active) setMenu(null);
+  }, [active]);
   const [folderDialog, setFolderDialog] = useState<'create' | 'rename' | null>(null);
   const [deleteFolderOpen, setDeleteFolderOpen] = useState(false);
   const hotkeyNoticeShown = useRef(false);
@@ -797,6 +797,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         await invoke('delete_clip', { id: clipId, hardDelete: true });
         forgetRevealed(clipId);
         setClips(remaining);
+        setDetailsOpen(false);
         setSelectedClipId(nextSelection);
         loadFolders();
         refreshTotalCount();
@@ -837,7 +838,12 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (document.documentElement.dataset.captureMode === 'true' || event.defaultPrevented) return;
+      if (
+        document.documentElement.dataset.captureMode === 'true' ||
+        event.defaultPrevented ||
+        (event.target instanceof Element && !!event.target.closest('[role="menu"]'))
+      )
+        return;
       // While the bulk-delete confirm is up, every shortcut here is wrong:
       // Delete would hard-delete the previewed clip mid-question, Escape would
       // close the whole window, and Enter would preventDefault the dialog's own
@@ -846,7 +852,12 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
       if (
         shortcutsSuspended(
           event,
-          bulkDeleteOpen || !!folderDialog || deleteFolderOpen || showWelcome
+          bulkDeleteOpen ||
+            !!folderDialog ||
+            deleteFolderOpen ||
+            showWelcome ||
+            !!menu ||
+            !!clearRequest
         )
       )
         return;
@@ -862,6 +873,11 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         // the query / closes. Notes and other fields must not close the window
         // even if they forget to stopPropagation (SBS-1008).
         if (isEditing && !isSearch) return;
+        if (detailsOpen) {
+          setDetailsOpen(false);
+          document.querySelector<HTMLInputElement>('[data-el="search-input"]')?.focus();
+          return;
+        }
         if (searchQuery) {
           setSearchQuery('');
           return;
@@ -871,6 +887,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
       }
       if (event.key === 'f' && (event.ctrlKey || event.metaKey)) {
         event.preventDefault();
+        setDetailsOpen(false);
         document.querySelector<HTMLInputElement>('[data-el="search-input"]')?.focus();
         return;
       }
@@ -925,6 +942,9 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
     searchQuery,
     selectedClipId,
     clipOrder,
+    detailsOpen,
+    menu,
+    clearRequest,
   ]);
 
   const hasNarrowingFilter =
@@ -969,191 +989,144 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
     >
       <header
         data-el="history-titlebar"
-        className="flex shrink-0 cursor-move items-center justify-between border-b border-border px-4 py-3"
+        className="flex h-8 shrink-0 cursor-move items-center justify-between px-3 pt-1"
         onMouseDown={(event) => {
           if (
             event.button !== 0 ||
-            (event.target as Element).closest('button, a, input, select, textarea, [role="button"]')
+            (event.target as Element).closest(
+              'button, a, input, select, textarea, [role="button"], [role="menu"]'
+            )
           )
             return;
           event.preventDefault();
           void invoke('start_history_drag').catch((error) => toast.error(String(error)));
         }}
       >
-        <div className="flex items-center gap-2.5">
-          <History size={17} />
-          <span className="text-sm font-semibold">Clipboard history</span>
-          <span className="ml-1 text-[10px] text-muted-foreground">Win+V</span>
+        <div className="flex min-w-0 items-center gap-2 text-muted-foreground">
+          <History size={14} />
+          <span className="truncate text-xs font-medium">Clipboard history</span>
+          <span className="text-[10px] opacity-60">{totalClipCount.toLocaleString()}</span>
         </div>
-        <div className="flex items-center gap-1.5">
-          <button
-            className={`${bulkActionClass} bg-primary/15`}
-            aria-label="Paste selected clip"
-            disabled={!selectedClip}
-            onClick={() => selectedClip && void handlePaste(selectedClip.id)}
-          >
-            <ClipboardPaste size={14} />
-            Paste
-          </button>
+        <div className="flex items-center gap-0.5">
           <button
             className="icon-button"
-            title="Screenshot (F1)"
-            aria-label="Screenshot (F1)"
+            title="Screenshot"
+            aria-label="Screenshot"
             onClick={() => void invoke('start_screenshot').catch((e) => toast.error(String(e)))}
           >
-            <Camera size={16} />
+            <Camera size={15} />
           </button>
-          <FeatureLauncher />
-          <button
-            className="icon-button"
-            title="Create Folder"
-            aria-label="Create Folder"
-            onClick={() => setFolderDialog('create')}
-          >
-            <Plus size={16} />
-          </button>
-          {selectedFolder && (
-            <>
-              <button
-                className="icon-button"
-                title="Rename Folder"
-                aria-label="Rename Folder"
-                onClick={() => setFolderDialog('rename')}
-              >
-                <Pencil size={14} />
-              </button>
-              <button
-                className="icon-button"
-                title="Delete Folder"
-                aria-label="Delete Folder"
-                onClick={() => setDeleteFolderOpen(true)}
-              >
-                <Trash2 size={14} />
-              </button>
-            </>
-          )}
-          <button
-            className="icon-button"
-            title="Settings"
-            aria-label="Settings"
-            onClick={() => void openSettings().catch((e) => toast.error(String(e)))}
-          >
-            <Settings2 size={16} />
-          </button>
+          <FeatureLauncher active={active} />
           <button
             type="button"
             onClick={handleClose}
-            onMouseDown={(event) => event.stopPropagation()}
             className="icon-button"
             aria-label="Close history"
           >
-            <X size={18} />
+            <X size={16} />
           </button>
         </div>
       </header>
-
-      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-4 py-2.5">
-        <div className="flex h-9 min-w-[180px] flex-1 items-center gap-2 rounded-[10px] border border-white/[0.08] bg-white/[0.055] px-3 focus-within:border-primary/45">
-          <Search size={15} className="shrink-0 text-muted-foreground" />
-          <input
-            data-el="search-input"
-            value={searchQuery}
-            onChange={(event) => setSearchQuery(event.target.value)}
-            placeholder="Search clipboard history"
-            aria-label="Search clipboard history"
-            className="min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-muted-foreground"
-          />
-          {searchQuery && (
-            <button
-              type="button"
-              onClick={() => setSearchQuery('')}
-              className="rounded p-1 text-muted-foreground hover:bg-white/10 hover:text-foreground"
-              aria-label="Clear search"
-            >
-              <X size={13} />
-            </button>
-          )}
-        </div>
-
-        <button
-          type="button"
-          onClick={() => setSelection((current) => toggleSelectAll(current, clipOrder))}
-          disabled={clips.length === 0}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-white/[0.08] px-2 py-1.5 text-[11px] text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-          title="Select every clip currently loaded"
+      <FlyoutHeader
+        searchQuery={searchQuery}
+        onSearchChange={(query) => {
+          setSearchQuery(query);
+          setDetailsOpen(false);
+        }}
+        contentFilter={contentFilter}
+        onContentFilterChange={(filter) => {
+          setContentFilter(filter);
+          setDetailsOpen(false);
+        }}
+        folders={folders}
+        selectedFolder={selectedFolder}
+        onSelectFolder={(folder) => {
+          setSelectedFolder(folder);
+          setDetailsOpen(false);
+        }}
+        onAddFolder={() => setFolderDialog('create')}
+        onOpenSettings={() => void openSettings().catch((e) => toast.error(String(e)))}
+        onOpenHistoryMenu={(event) => {
+          const r = event.currentTarget.getBoundingClientRect();
+          setMenu({ x: r.right, y: r.bottom });
+        }}
+        selectedClipId={selectedClipId}
+        hasClipListbox={!isLoading && clips.length > 0}
+      />
+      {filtersOpen && (
+        <div
+          data-el="history-filters"
+          className="flex shrink-0 flex-wrap items-center gap-1 border-b border-border px-3 py-1"
         >
-          <CheckSquare size={13} />
-          {selectionCount > 0 && selectionCount === clips.length ? 'None' : 'All'}
-        </button>
-
-        <div className="flex shrink-0 items-center gap-1">
-          {CONTENT_FILTERS.map(([id, label]) => (
-            <button
-              key={id}
-              type="button"
-              onClick={() => setContentFilter(id)}
-              aria-pressed={contentFilter === id}
-              className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                contentFilter === id
-                  ? 'bg-white/[0.09] text-foreground'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              {t(label)}
-            </button>
-          ))}
-        </div>
-
-        <select
-          value={selectedFolder ?? ''}
-          onChange={(event) => setSelectedFolder(event.target.value || null)}
-          className={filterSelectClass}
-          aria-label="Filter by folder"
-        >
-          <option value="">All folders</option>
-          {folders.map((folder) => (
-            <option key={folder.id} value={folder.id}>
-              {folder.name}
-            </option>
-          ))}
-        </select>
-
-        <select
-          value={sourceApp ?? ''}
-          onChange={(event) => setSourceApp(event.target.value || null)}
-          className={filterSelectClass}
-          aria-label="Filter by source app"
-        >
-          <option value="">All apps</option>
-          {/* A previously chosen app can vanish from the list once its last
+          <select
+            value={sourceApp ?? ''}
+            onChange={(event) => setSourceApp(event.target.value || null)}
+            className={filterSelectClass}
+            aria-label="Filter by source app"
+          >
+            <option value="">All apps</option>
+            {/* A previously chosen app can vanish from the list once its last
               clip is deleted. Keep it as an option so the control still shows
               what is actually being filtered on. */}
-          {sourceApp && !sourceApps.some((app) => app.name === sourceApp) && (
-            <option value={sourceApp}>{sourceApp} (0)</option>
-          )}
-          {sourceApps.map((app) => (
-            <option key={app.name} value={app.name}>
-              {app.name} ({app.count})
-            </option>
-          ))}
-        </select>
+            {sourceApp && !sourceApps.some((app) => app.name === sourceApp) && (
+              <option value={sourceApp}>{sourceApp} (0)</option>
+            )}
+            {sourceApps.map((app) => (
+              <option key={app.name} value={app.name}>
+                {app.name} ({app.count})
+              </option>
+            ))}
+          </select>
 
-        <select
-          value={datePreset}
-          onChange={(event) => setDatePreset(event.target.value as DatePreset)}
-          className={filterSelectClass}
-          aria-label="Filter by date"
+          <select
+            value={datePreset}
+            onChange={(event) => setDatePreset(event.target.value as DatePreset)}
+            className={filterSelectClass}
+            aria-label="Filter by date"
+          >
+            {(Object.keys(DATE_PRESET_LABELS) as (keyof typeof DATE_PRESET_LABELS)[]).map((key) => (
+              <option key={key} value={key}>
+                {t(DATE_PRESET_LABELS[key])}
+              </option>
+            ))}
+            <option value="custom">Custom range…</option>
+          </select>
+        </div>
+      )}
+
+      {!filtersOpen && (sourceApp || datePreset !== 'all') && (
+        <div
+          data-el="active-history-filters"
+          className="flex shrink-0 items-center justify-between gap-2 px-3 pb-1 text-[11px] text-muted-foreground"
         >
-          {(Object.keys(DATE_PRESET_LABELS) as (keyof typeof DATE_PRESET_LABELS)[]).map((key) => (
-            <option key={key} value={key}>
-              {t(DATE_PRESET_LABELS[key])}
-            </option>
-          ))}
-          <option value="custom">Custom range…</option>
-        </select>
-      </div>
-
-      {datePreset === 'custom' && (
+          <span className="truncate">
+            {[
+              sourceApp,
+              datePreset === 'all'
+                ? null
+                : datePreset === 'custom'
+                  ? t('Custom range…')
+                  : t(DATE_PRESET_LABELS[datePreset]),
+            ]
+              .filter(Boolean)
+              .join(' · ')}
+          </span>
+          <button
+            type="button"
+            aria-label="Clear filters"
+            className="icon-button"
+            onClick={() => {
+              setSourceApp(null);
+              setDatePreset('all');
+              setCustomFrom('');
+              setCustomTo('');
+            }}
+          >
+            <X size={12} />
+          </button>
+        </div>
+      )}
+      {filtersOpen && datePreset === 'custom' && (
         <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2 text-xs text-muted-foreground">
           <label className="flex items-center gap-1.5">
             From
@@ -1247,9 +1220,12 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
       )}
 
       <main className="flex min-h-0 flex-1">
-        <div className="min-h-0 w-[40%] min-w-[280px] max-w-[420px] shrink-0 border-r border-border">
+        <div
+          data-el="history-list-pane"
+          className={detailsOpen ? 'hidden' : 'min-h-0 min-w-0 flex-1'}
+        >
           <ClipList
-            active={active}
+            active={active && !detailsOpen}
             clips={clips}
             isLoading={isLoading}
             hasMore={hasMore}
@@ -1264,11 +1240,19 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
             // somewhere else.
             selectOnHover={false}
             selectable
+            selectionControlsVisible={multiSelectMode || selectionCount > 0}
             keyboardNavigation
             checkedIds={selection.ids}
             onToggleSelect={handleToggleSelect}
             onSelectClip={setSelectedClipId}
-            onPaste={setSelectedClipId}
+            onPaste={(id) => {
+              setSelectedClipId(id);
+              setDetailsOpen(true);
+            }}
+            onCardContextMenu={(event, clipId) => {
+              setSelectedClipId(clipId);
+              setMenu({ x: event.clientX, y: event.clientY, clipId });
+            }}
             onActivate={handlePaste}
             onCopy={handleCopy}
             revealedClips={revealed}
@@ -1280,47 +1264,155 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
             onRetry={() => loadClips(false)}
           />
         </div>
-        <div className="min-h-0 min-w-0 flex-1">
-          <ClipPreview
-            active={active}
-            clip={selectedClip}
-            onEditImage={(id) => imageAction('edit_clip_image', id)}
-            onPinImage={(id) => imageAction('pin_clip_image', id)}
-            onSaveImage={(id) => imageAction('save_clip_image', id)}
-            onCopy={handleCopy}
-            onCopyOcrText={handleCopyOcrText}
-            onCopySelection={handleCopySelection}
-            onOpenImage={handleOpenImage}
-            onSaveOcrText={handleSaveOcrText}
-            onRescanOcr={handleRescanOcr}
-            onCopyText={handleCopySelection}
-            onSaveText={handleSaveText}
-            onSaveNotes={handleSaveNotes}
-            onToggleHidden={handleToggleHidden}
-            revealed={selectedClipId ? revealed.get(selectedClipId) : undefined}
-            onToggleReveal={handleToggleReveal}
-            onDelete={handleDelete}
-          />
+        <div
+          data-el="history-detail-pane"
+          className={detailsOpen ? 'flex min-h-0 min-w-0 flex-1 flex-col' : 'hidden'}
+        >
+          <div className="flex h-9 shrink-0 items-center justify-between border-b border-border px-3">
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+              aria-label="Back to history"
+              onClick={() => {
+                setDetailsOpen(false);
+                document.querySelector<HTMLInputElement>('[data-el="search-input"]')?.focus();
+              }}
+            >
+              <ArrowLeft size={14} />
+              {t('Back to history')}
+            </button>
+            <button
+              type="button"
+              className={bulkActionClass}
+              disabled={!selectedClip}
+              onClick={() => selectedClip && void handlePaste(selectedClip.id)}
+            >
+              <ClipboardPaste size={13} />
+              Paste
+            </button>
+          </div>
+          <div className="min-h-0 flex-1">
+            <ClipPreview
+              active={active && detailsOpen}
+              clip={selectedClip}
+              onEditImage={(id) => imageAction('edit_clip_image', id)}
+              onPinImage={(id) => imageAction('pin_clip_image', id)}
+              onSaveImage={(id) => imageAction('save_clip_image', id)}
+              onCopy={handleCopy}
+              onCopyOcrText={handleCopyOcrText}
+              onCopySelection={handleCopySelection}
+              onOpenImage={handleOpenImage}
+              onSaveOcrText={handleSaveOcrText}
+              onRescanOcr={handleRescanOcr}
+              onCopyText={handleCopySelection}
+              onSaveText={handleSaveText}
+              onSaveNotes={handleSaveNotes}
+              onToggleHidden={handleToggleHidden}
+              revealed={selectedClipId ? revealed.get(selectedClipId) : undefined}
+              onToggleReveal={handleToggleReveal}
+              onDelete={handleDelete}
+            />
+          </div>
         </div>
       </main>
 
-      <footer className="flex h-9 shrink-0 items-center border-t border-border px-4 text-[10px] text-muted-foreground">
-        <span>{totalClipCount.toLocaleString()} 条记录</span>
-        <div className="ml-auto flex items-center gap-3">
-          <span>
-            <kbd>↑↓</kbd> Select
-          </span>
-          <span>
-            <kbd>Enter</kbd> Paste
-          </span>
-          <span>
-            <kbd>Delete</kbd> Remove
-          </span>
-          <span>
-            <kbd>Esc</kbd> Close
-          </span>
-        </div>
-      </footer>
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          kind={menu.clipId ? 'card' : 'history'}
+          onClose={() => setMenu(null)}
+          options={
+            menu.clipId
+              ? [
+                  {
+                    label: t('Details'),
+                    onClick: () => {
+                      setSelectedClipId(menu.clipId!);
+                      setDetailsOpen(true);
+                    },
+                  },
+                  { label: t('Copy'), onClick: () => void handleCopy(menu.clipId!) },
+                  { label: t('Paste'), onClick: () => void handlePaste(menu.clipId!) },
+                  {
+                    label: t(clips.find((c) => c.id === menu.clipId)?.is_pinned ? 'Unpin' : 'Pin'),
+                    onClick: () => void handleTogglePin(menu.clipId!),
+                  },
+                ]
+              : [
+                  { label: t('More filters'), onClick: () => setFiltersOpen((v) => !v) },
+                  {
+                    label: t('Clear filters'),
+                    onClick: () => {
+                      setSearchQuery('');
+                      setContentFilter('all');
+                      setSelectedFolder(null);
+                      setSourceApp(null);
+                      setDatePreset('all');
+                      setCustomFrom('');
+                      setCustomTo('');
+                    },
+                  },
+                  {
+                    label: t(multiSelectMode ? 'Done selecting' : 'Select clips'),
+                    onClick: () => {
+                      setMultiSelectMode((v) => !v);
+                      clearSelection();
+                    },
+                  },
+                  {
+                    label: t('Select all'),
+                    disabled: clips.length === 0,
+                    onClick: () => setSelection(toggleSelectAll(EMPTY_SELECTION, clipOrder)),
+                  },
+                  ...(selectedFolder
+                    ? [
+                        { label: t('Rename Folder'), onClick: () => setFolderDialog('rename') },
+                        {
+                          label: t('Delete Folder'),
+                          danger: true,
+                          onClick: () => setDeleteFolderOpen(true),
+                        },
+                      ]
+                    : []),
+                  {
+                    label: t('Clear unpinned items…'),
+                    disabled: totalClipCount === 0,
+                    onClick: () => setClearRequest('unpinned'),
+                  },
+                  {
+                    label: t('Clear everything…'),
+                    danger: true,
+                    disabled: totalClipCount === 0,
+                    onClick: () => setClearRequest('all'),
+                  },
+                ]
+          }
+        />
+      )}
+      <ConfirmDialog
+        isOpen={clearRequest !== null}
+        title={clearRequest === 'all' ? 'Clear everything?' : 'Clear unpinned items?'}
+        message="This cannot be undone."
+        confirmText="Clear"
+        isBusy={clearing}
+        onCancel={() => setClearRequest(null)}
+        onConfirm={() => {
+          if (!clearRequest || clearing) return;
+          setClearing(true);
+          void invoke(clearRequest === 'all' ? 'clear_all_clips' : 'clear_unpinned_clips')
+            .then(async () => {
+              clearSelection();
+              setDetailsOpen(false);
+              setClearRequest(null);
+              await loadClips(false);
+              await loadFolders();
+              await refreshTotalCount();
+            })
+            .catch((e) => toast.error(String(e)))
+            .finally(() => setClearing(false));
+        }}
+      />
       <Toaster richColors position="bottom-center" theme={effectiveTheme} />
       {showWelcome && (
         <WelcomeOverlay

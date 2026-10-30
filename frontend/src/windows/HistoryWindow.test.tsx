@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
+import { setGlobalLang } from '../i18n';
 import { HistoryWindow } from './HistoryWindow';
 
 const native = vi.hoisted(() => ({
@@ -38,6 +39,7 @@ beforeAll(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn();
 });
 beforeEach(() => {
+  setGlobalLang('en');
   vi.clearAllMocks();
   delete document.documentElement.dataset.captureMode;
   vi.mocked(invoke).mockImplementation(async (command) => {
@@ -83,7 +85,7 @@ describe('unified Win+V history keyboard contract', () => {
       fireEvent.mouseDown(button.querySelector('svg') ?? button, { button: 0 });
     }
     expect(vi.mocked(invoke).mock.calls.some(([c]) => c === 'start_history_drag')).toBe(false);
-    fireEvent.click(header.querySelector('button[aria-label="Screenshot (F1)"]')!);
+    fireEvent.click(header.querySelector('button[aria-label="Screenshot"]')!);
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('start_screenshot'));
     fireEvent.click(header.querySelector('button[aria-label="Close history"]')!);
     await waitFor(() => expect(invoke).toHaveBeenCalledWith('hide_history_window'));
@@ -196,4 +198,59 @@ describe('unified Win+V history keyboard contract', () => {
       expect(invoke).toHaveBeenCalledWith('paste_clip', { id: 'first', plainText: false })
     );
   });
+});
+
+describe('compact Cubby history', () => {
+  it('keeps details and selection controls out of the default list, then opens details on a clip click', async () => {
+    const { container } = await open();
+    expect(container.querySelector('footer')).toBeNull();
+    expect(container.querySelector('kbd')).toBeNull();
+    expect(container.querySelector('[data-el="history-detail-pane"]')).toHaveClass('hidden');
+    expect(container.querySelector('[data-el="clip-checkbox"]')).toBeNull();
+    fireEvent.click(container.querySelector('[data-clip-id="first"]')!);
+    expect(container.querySelector('[data-el="history-list-pane"]')).toHaveClass('hidden');
+    expect(container.querySelector('[data-el="history-detail-pane"]')).not.toHaveClass('hidden');
+    fireEvent.click(container.querySelector('[aria-label="Back to history"]')!);
+    expect(container.querySelector('[data-el="history-detail-pane"]')).toHaveClass('hidden');
+    expect(document.activeElement).toBe(container.querySelector('[data-el="search-input"]'));
+  });
+  it('closes the capture menu on Escape without closing clipboard history', async () => {
+    const { container } = await open();
+    fireEvent.click(container.querySelector('[aria-label="Capture tools"]')!);
+    const menu = container.querySelector('[role="menu"]')!;
+    expect(menu).not.toBeNull();
+    vi.mocked(invoke).mockClear();
+    fireEvent.keyDown(menu.querySelector('[role="menuitem"]')!, { key: 'Escape' });
+    expect(container.querySelector('[role="menu"]')).toBeNull();
+    expect(vi.mocked(invoke).mock.calls.some(([name]) => name === 'hide_history_window')).toBe(
+      false
+    );
+  });
+  it('keeps clearing destructive history behind a confirmation', async () => {
+    const { container } = await open();
+    fireEvent.click(container.querySelector('[aria-label="Clipboard history actions"]')!);
+    const clear = Array.from(container.querySelectorAll('[role="menuitem"]')).find(
+      (n) => n.textContent === 'Clear unpinned items…'
+    )!;
+    fireEvent.click(clear);
+    expect(vi.mocked(invoke).mock.calls.some(([name]) => name === 'clear_unpinned_clips')).toBe(
+      false
+    );
+    const dialog = container.querySelector('[role="dialog"],[role="alertdialog"]')!;
+    expect(dialog).not.toBeNull();
+    fireEvent.click(
+      Array.from(dialog.querySelectorAll('button')).find((n) => n.textContent === 'Clear')!
+    );
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('clear_unpinned_clips'));
+  });
+});
+
+it('changes relative timestamps with the interface language', async () => {
+  fixture.created_at = new Date(Date.now() - 120000).toISOString();
+  const { container } = await open();
+  const row = container.querySelector('[data-clip-id="first"]')!;
+  expect(row.textContent).toContain('ago');
+  act(() => setGlobalLang('zh-CN'));
+  expect(row.textContent).toContain('前');
+  expect(row.textContent).not.toContain('ago');
 });

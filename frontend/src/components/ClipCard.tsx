@@ -1,3 +1,5 @@
+import { zhCN as chineseDateLocale } from 'date-fns/locale/zh-CN';
+import { useTranslation } from '../i18n';
 import { invoke } from '@tauri-apps/api/core';
 import { ClipboardItem } from '../types';
 import { clsx } from 'clsx';
@@ -43,6 +45,7 @@ interface ClipCardProps {
   setSize: number;
   /** Multi-select is available (History window only; the flyout omits this). */
   selectable?: boolean;
+  selectionControlsVisible?: boolean;
   /** Whether this row is in the multi-select set. */
   isChecked?: boolean;
   /** Toggle multi-selection. The event carries the modifiers, so the caller can
@@ -78,10 +81,12 @@ export const ClipCard = memo(function ClipCard({
   posInSet,
   setSize,
   selectable = false,
+  selectionControlsVisible = selectable,
   isChecked = false,
   onToggleSelect,
   active = true,
 }: ClipCardProps) {
+  const { lang } = useTranslation();
   // A hidden row arrives carrying no content. Once revealed for the session the
   // real payload is fetched separately, so render that in its place — but only
   // the payload. The revealed copy is a snapshot taken when the fetch returned,
@@ -103,9 +108,12 @@ export const ClipCard = memo(function ClipCard({
   const age = useMemo(() => {
     const parsed = new Date(clip.created_at);
     if (Number.isNaN(parsed.getTime())) return '';
-    return formatDistanceToNowStrict(parsed, { addSuffix: true });
+    return formatDistanceToNowStrict(parsed, {
+      addSuffix: true,
+      locale: lang === 'zh-CN' ? chineseDateLocale : undefined,
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clip.created_at, timeTick]);
+  }, [clip.created_at, timeTick, lang]);
 
   const label = sourceLabel(clip.source_app, clip.clip_type);
   const preview = normalizePreviewText(clip.content || clip.preview);
@@ -191,7 +199,7 @@ export const ClipCard = memo(function ClipCard({
         />
       )}
 
-      {selectable && (
+      {selectable && selectionControlsVisible && (
         <input
           type="checkbox"
           checked={isChecked}

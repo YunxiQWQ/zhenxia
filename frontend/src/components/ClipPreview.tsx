@@ -1,3 +1,5 @@
+import { zhCN as chineseDateLocale } from 'date-fns/locale/zh-CN';
+import { useTranslation } from '../i18n';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { clsx } from 'clsx';
@@ -102,6 +104,7 @@ export function ClipPreview({
   onToggleReveal,
   onDelete,
 }: ClipPreviewProps) {
+  const { lang } = useTranslation();
   // Null when not editing; otherwise the working copy of the text.
   const [draft, setDraft] = useState<string | null>(null);
   // Working copy of the recognized text while the scan panel is open.
@@ -262,7 +265,9 @@ export function ClipPreview({
   const kind = isImage ? imageLabel(label) : contentKind(text, clip.clip_type);
   const captured = (() => {
     const parsed = new Date(clip.created_at);
-    return Number.isNaN(parsed.getTime()) ? null : format(parsed, 'PPpp');
+    return Number.isNaN(parsed.getTime())
+      ? null
+      : format(parsed, 'PPpp', { locale: lang === 'zh-CN' ? chineseDateLocale : undefined });
   })();
   const dimensions =
     imageMetadata.width && imageMetadata.height

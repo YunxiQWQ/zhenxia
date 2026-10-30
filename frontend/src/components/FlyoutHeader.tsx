@@ -23,7 +23,7 @@ interface FlyoutHeaderProps {
   onAddFolder: () => void;
   onOpenHistoryMenu: (event: React.MouseEvent<HTMLButtonElement>) => void;
   /** Opens the dedicated History window (SOU-582). */
-  onOpenHistoryWindow: () => void;
+  onOpenHistoryWindow?: () => void;
   onOpenSettings: () => void;
   /** Id of the currently selected clip, or null. Drives aria-activedescendant. */
   selectedClipId: string | null;
@@ -138,15 +138,17 @@ export function FlyoutHeader({
           >
             <Plus size={15} />
           </button>
-          <button
-            type="button"
-            onClick={onOpenHistoryWindow}
-            className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-white/[0.07] hover:text-foreground"
-            title="Open History window"
-            aria-label="Open History window"
-          >
-            <History size={15} />
-          </button>
+          {onOpenHistoryWindow && (
+            <button
+              type="button"
+              onClick={onOpenHistoryWindow}
+              className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-white/[0.07] hover:text-foreground"
+              title="Open History window"
+              aria-label="Open History window"
+            >
+              <History size={15} />
+            </button>
+          )}
           <button
             type="button"
             onClick={onOpenHistoryMenu}

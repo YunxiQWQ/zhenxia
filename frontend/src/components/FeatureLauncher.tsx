@@ -1,60 +1,54 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { ScanLine, Video, Presentation, Shapes } from 'lucide-react';
+import { Shapes } from 'lucide-react';
 import { toast } from 'sonner';
 import { useTranslation } from '../i18n';
-export function FeatureLauncher() {
-  const { lang } = useTranslation(),
-    [open, setOpen] = useState(false),
-    root = useRef<HTMLDivElement>(null),
-    t = (cn: string, en: string) => (lang === 'zh-CN' ? cn : en);
+import { ContextMenu } from './ContextMenu';
+
+export function FeatureLauncher({ active = true }: { active?: boolean }) {
+  const { lang } = useTranslation();
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const text = (cn: string, en: string) => (lang === 'zh-CN' ? cn : en);
   useEffect(() => {
-    const close = (e: PointerEvent) => {
-      if (!root.current?.contains(e.target as Node)) setOpen(false);
-    };
-    window.addEventListener('pointerdown', close);
-    return () => window.removeEventListener('pointerdown', close);
-  }, []);
+    if (!active) setMenu(null);
+  }, [active]);
   return (
-    <div className="relative" ref={root}>
+    <>
       <button
-        aria-label={t('截图工具', 'Capture tools')}
-        title={t('截图工具', 'Capture tools')}
-        className="rounded-lg p-2 hover:bg-accent"
-        aria-expanded={open}
-        onClick={() => setOpen(!open)}
+        aria-label={text('截图工具', 'Capture tools')}
+        title={text('截图工具', 'Capture tools')}
+        className="icon-button"
+        aria-expanded={!!menu}
+        aria-haspopup="menu"
+        onClick={(event) => {
+          const r = event.currentTarget.getBoundingClientRect();
+          setMenu(menu ? null : { x: r.right, y: r.bottom });
+        }}
       >
-        <Shapes size={16} />
+        <Shapes size={15} />
       </button>
-      {open && (
-        <div className="absolute right-0 top-full z-50 w-52 rounded-xl border border-border bg-background p-1 shadow-lg">
-          {[
-            { id: 'scroll', cn: '长截图', en: 'Scrolling capture', Icon: ScanLine },
-            { id: 'record', cn: '录屏', en: 'Screen recording', Icon: Video },
-            {
-              id: 'presentation',
-              cn: '演示画布 / 恢复操作',
-              en: 'Presentation / restore',
-              Icon: Presentation,
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          kind="history"
+          label={text('截图工具', 'Capture tools')}
+          onClose={() => setMenu(null)}
+          options={[
+            { id: 'scroll', cn: '长截图', en: 'Scrolling capture' },
+            { id: 'record', cn: '录屏', en: 'Screen recording' },
+            { id: 'presentation', cn: '演示画布 / 恢复操作', en: 'Presentation / restore' },
+          ].map(({ id, cn, en }) => ({
+            label: text(cn, en),
+            onClick: () => {
+              void invoke(
+                id === 'presentation' ? 'start_presentation' : 'start_workflow_capture',
+                id === 'presentation' ? {} : { kind: id }
+              ).catch((e) => toast.error(String(e)));
             },
-          ].map(({ id, cn, en, Icon }) => (
-            <button
-              key={id}
-              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-accent"
-              onClick={() => {
-                setOpen(false);
-                void invoke(
-                  id === 'presentation' ? 'start_presentation' : 'start_workflow_capture',
-                  id === 'presentation' ? {} : { kind: id }
-                ).catch((e) => toast.error(String(e)));
-              }}
-            >
-              <Icon size={15} />
-              {t(cn, en)}
-            </button>
-          ))}
-        </div>
+          }))}
+        />
       )}
-    </div>
+    </>
   );
 }

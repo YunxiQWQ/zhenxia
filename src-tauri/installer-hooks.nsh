@@ -20,5 +20,7 @@
   ; installMode is currentUser, so the entry is always under HKCU. Deleting a
   ; value that was never created is not an error in NSIS, so this is safe for
   ; users who never enabled autostart.
-  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Zhenxia"
+  ${If} $UpdateMode <> 1
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Zhenxia"
+  ${EndIf}
 !macroend

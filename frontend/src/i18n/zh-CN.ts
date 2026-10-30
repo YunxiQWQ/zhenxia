@@ -4,6 +4,12 @@
  * 迁移自 cubby-clipboard-zh 的 chinese-ui.ts，补充截图/贴图/品牌词条。
  */
 export const zhCN: Record<string, string> = {
+  'More filters': '更多筛选',
+  'Clear filters': '清除筛选',
+  'Select clips': '多选',
+  'Done selecting': '结束多选',
+  'Back to history': '返回历史记录',
+  Details: '详情',
   // ── 品牌 ──
   'Loading Cubby': '正在加载帧匣',
   'Welcome to Cubby': '欢迎使用帧匣',
