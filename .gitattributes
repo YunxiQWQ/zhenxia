@@ -6,3 +6,4 @@ THIRD-PARTY-NOTICES.txt -whitespace
 LICENSE-LaterScreen.txt -whitespace
 LICENSE-SnowAir.txt -whitespace
 NOTICE-SnowAir.txt -whitespace
+LICENSES/installer/** -whitespace

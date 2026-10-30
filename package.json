@@ -1,6 +1,6 @@
 {
   "name": "zhenxia",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Clipboard history, screenshots, scrolling capture, recording and presentation for Windows",
   "license": "GPL-3.0-only",
   "type": "module",

@@ -27,3 +27,9 @@ Optional OCR/translation engines and models are downloaded only when requested; 
 The combined application remains GPL-3.0-only; MIT, BSD, Apache-2.0, MPL-2.0 and other compatible dependency notices are retained rather than replaced. Apache-2.0 compatibility with GPLv3 is described by the [Apache Software Foundation](https://www.apache.org/licenses/GPL-compatibility.html). The GPL does not remove the upstream copyright, attribution or source obligations.
 
 Zhenxia is an independent fork. Attribution does not imply endorsement by upstream authors. This repository starts from attributed source snapshots; the upstream Git histories remain available at their original repositories.
+
+## Installer components
+
+The Windows installer uses the unmodified NSIS 3.13 installer stub and built-in plug-ins with zlib compression, under the applicable zlib/libpng terms. The complete upstream module license notice is preserved in `LICENSES/installer/NSIS-3.13-COPYING.txt`. NSIS source and releases: https://nsis.sourceforge.io/Download .
+
+The installer also contains the unmodified `nsis_tauri_utils.dll` v0.5.3 from https://github.com/tauri-apps/nsis-tauri-utils/tree/nsis_tauri_utils-v0.5.3 , used under its MIT option. Its copyright and license are preserved in `LICENSES/installer/nsis-tauri-utils-0.5.3-MIT.txt`. These installer components retain their original licenses; the Zhenxia application remains GPL-3.0-only.
