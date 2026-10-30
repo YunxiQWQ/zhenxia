@@ -1,0 +1,5496 @@
+use tauri::{AppHandle, Emitter};
+// Import functions directly from the crate root
+use crate::database::Database;
+#[cfg(target_os = "windows")]
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+#[cfg(not(target_os = "windows"))]
+use clipboard_rs::common::RustImage;
+#[cfg(not(target_os = "windows"))]
+use clipboard_rs::common::RustImageData;
+#[cfg(not(target_os = "windows"))]
+use clipboard_rs::{Clipboard, ClipboardContext};
+#[cfg(target_os = "windows")]
+use clipboard_win::Monitor;
+use once_cell::sync::Lazy;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+#[cfg(target_os = "windows")]
+use std::ffi::OsStr;
+#[cfg(target_os = "windows")]
+use std::os::windows::ffi::OsStrExt;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::CloseHandle;
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    GetObjectW, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HBITMAP,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::System::DataExchange::GetClipboardOwner;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::Shell::{
+    SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, DrawIconEx, GetForegroundWindow, GetIconInfo, GetWindowThreadProcessId, DI_NORMAL,
+    ICONINFO,
+};
+
+// GLOBAL STATE: Store the hash of the clip we just pasted ourselves.
+// If the next clipboard change matches this hash, we ignore it (don't update timestamp).
+/// Hash of a clipboard write Cubby made itself, with the time it was written.
+/// A snapshot queued while this marker is live carries the hash and generation
+/// so a backed-up consumer still ignores the echo after the wall-clock TTL
+/// (SBS-1022) without consuming a later paste of the same content. Consumed
+/// generation lives next to the marker so a same-hash re-copy that bound the
+/// same generation is not swallowed after the echo is ignored.
+static IGNORE_HASH: Lazy<parking_lot::Mutex<ignore_hash::IgnoreState>> =
+    Lazy::new(|| parking_lot::Mutex::new(ignore_hash::IgnoreState::default()));
+static LAST_STABLE_HASH: Lazy<parking_lot::Mutex<Option<String>>> =
+    Lazy::new(|| parking_lot::Mutex::new(None));
+/// Most recent accepted capture, used to forget extension password copies when
+/// the clipboard is auto-cleared shortly afterward (SOU-316).
+static LAST_ACCEPTED_CAPTURE: Lazy<parking_lot::Mutex<Option<RecentCapture>>> =
+    Lazy::new(|| parking_lot::Mutex::new(None));
+pub static CLIPBOARD_SYNC: Lazy<Arc<tokio::sync::Mutex<()>>> =
+    Lazy::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
+/// Password-manager extensions typically clear within tens of seconds. Keep this
+/// short so a deliberate later clear does not erase an intentional keep.
+const CLIPBOARD_CLEAR_FORGET_WINDOW: Duration = Duration::from_secs(90);
+/// SQLITE_BUSY during forget-on-clear used to restore the marker and wait for
+/// another clear that never comes. Retry the same clear a few times instead
+/// (SBS-1003).
+const FORGET_ON_CLEAR_ATTEMPTS: u8 = 3;
+const FORGET_ON_CLEAR_RETRY_DELAY: Duration = Duration::from_millis(80);
+#[cfg(target_os = "windows")]
+const CF_DIB_FORMAT: u32 = 8;
+
+#[derive(Clone, Debug)]
+struct RecentCapture {
+    uuid: String,
+    captured_at: Instant,
+    /// Whether the captured text was credential-shaped at capture time. An
+    /// auto-clear only forgets credential-shaped captures: password managers
+    /// clear on a timer regardless of what is on the clipboard by then, so an
+    /// unconditional forget could delete an innocent note copied after the
+    /// password (the wrong-clip bug).
+    credential_like: bool,
+}
+
+mod forget_on_clear;
+mod snapshot_channel;
+mod snapshot_queue;
+use forget_on_clear::{
+    next_forget_attempts, select_forget_attempt, ForgetAttempt, ForgetClipLookup,
+};
+use snapshot_queue::SizedPayload;
+mod ignore_hash;
+use ignore_hash::{bind_ignore_hash_for_queued_work, IGNORE_HASH_TTL};
+
+/// Pure helper for SOU-316 unit tests: only empty clears within the window
+/// forget the last clip. A later clear must leave history alone.
+fn should_forget_recent_capture(
+    captured_at: Instant,
+    cleared_at: Instant,
+    window: Duration,
+) -> bool {
+    cleared_at
+        .checked_duration_since(captured_at)
+        .is_some_and(|elapsed| elapsed <= window)
+}
+
+/// Capture-listener health (SOU-218). Values are diagnostics only — never clipboard content.
+///
+/// Defaults:
+/// - restart forever with capped exponential backoff (500ms → 30s)
+/// - sequence watchdog every 2s; force restart after 5s of missed advances
+/// - no user-facing toast (logs + `get_clipboard_capture_status` only)
+const CAPTURE_STATE_STOPPED: u8 = 0;
+const CAPTURE_STATE_LISTENING: u8 = 1;
+const CAPTURE_STATE_RESTARTING: u8 = 2;
+const INITIAL_LISTENER_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_LISTENER_BACKOFF: Duration = Duration::from_secs(30);
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
+const STALE_LISTENER_AFTER: Duration = Duration::from_secs(5);
+/// How many times one clipboard sequence may be deferred under contention
+/// before the copy is written off. Each deferral costs roughly
+/// `STALE_LISTENER_AFTER` plus a listener restart, so this bounds a stuck
+/// clipboard owner to about twelve seconds of retrying instead of forever.
+const MAX_DEFERRALS_PER_SEQUENCE: u32 = 3;
+
+static CAPTURE_STATE: AtomicU8 = AtomicU8::new(CAPTURE_STATE_STOPPED);
+static LAST_CLIPBOARD_EVENT_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_HANDLED_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+static LISTENER_RESTART_COUNT: AtomicU64 = AtomicU64::new(0);
+/// The sequence currently being retried, and how many times it has been
+/// deferred. Only ever touched from the listener thread.
+static DEFERRED_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+static DEFERRED_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+static LAST_CAPTURE_ERROR: Lazy<parking_lot::Mutex<Option<String>>> =
+    Lazy::new(|| parking_lot::Mutex::new(None));
+#[cfg(target_os = "windows")]
+static LISTENER_SHUTDOWN: Lazy<parking_lot::Mutex<Option<clipboard_win::monitor::Shutdown>>> =
+    Lazy::new(|| parking_lot::Mutex::new(None));
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClipboardCaptureStatus {
+    pub state: String,
+    pub listening: bool,
+    pub restart_count: u64,
+    pub last_event_unix_ms: u64,
+    pub last_handled_sequence: u32,
+    pub last_error: Option<String>,
+}
+
+pub fn set_ignore_hash(hash: String) {
+    let mut lock = IGNORE_HASH.lock();
+    // A new paste is a new generation. Leave consumed_generation in place so
+    // old queued echos still see their generation as already spent.
+    lock.marker = Some(ignore_hash::IgnoreMarker::new(hash));
+}
+
+pub(crate) fn clear_ignore_hash_if_matches(hash: &str) {
+    let mut lock = IGNORE_HASH.lock();
+    if lock
+        .marker
+        .as_ref()
+        .is_some_and(|marked| marked.hash == hash)
+    {
+        lock.marker.take();
+    }
+}
+
+/// Forget the consecutive-duplicate marker after history is deleted. Without
+/// this, deleting a clip and copying the same content again is silently
+/// dropped ("capture is broken" from the user's perspective): the marker still
+/// holds the deleted clip's hash and suppresses the re-copy.
+pub fn reset_capture_dedup() {
+    *LAST_STABLE_HASH.lock() = None;
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn capture_state_name(state: u8) -> &'static str {
+    match state {
+        CAPTURE_STATE_LISTENING => "listening",
+        CAPTURE_STATE_RESTARTING => "restarting",
+        _ => "stopped",
+    }
+}
+
+fn set_capture_state(state: u8) {
+    CAPTURE_STATE.store(state, Ordering::SeqCst);
+}
+
+fn record_capture_error(message: impl Into<String>) {
+    let message = message.into();
+    log::error!("CLIPBOARD: {message}");
+    *LAST_CAPTURE_ERROR.lock() = Some(message);
+}
+
+fn note_clipboard_event(sequence: u32) {
+    LAST_HANDLED_SEQUENCE.store(sequence, Ordering::SeqCst);
+    LAST_CLIPBOARD_EVENT_UNIX_MS.store(unix_now_ms(), Ordering::SeqCst);
+}
+
+fn next_listener_backoff(current: Duration) -> Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(MAX_LISTENER_BACKOFF)
+        .min(MAX_LISTENER_BACKOFF)
+}
+
+#[tauri::command]
+pub fn get_clipboard_capture_status() -> ClipboardCaptureStatus {
+    let state = CAPTURE_STATE.load(Ordering::SeqCst);
+    ClipboardCaptureStatus {
+        state: capture_state_name(state).to_string(),
+        listening: state == CAPTURE_STATE_LISTENING,
+        restart_count: LISTENER_RESTART_COUNT.load(Ordering::SeqCst),
+        last_event_unix_ms: LAST_CLIPBOARD_EVENT_UNIX_MS.load(Ordering::SeqCst),
+        last_handled_sequence: LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst),
+        last_error: LAST_CAPTURE_ERROR.lock().clone(),
+    }
+}
+
+pub fn init(app: &AppHandle, db: Arc<Database>) {
+    crate::ocr_queue::init(app.clone(), db.clone());
+    // SBS-1032: snapshots carry full PNG/HTML/RTF bytes. The queue is
+    // bounded (drop-oldest, Cleared retained — SBS-1045); see
+    // `snapshot_queue` for the policy.
+    let (event_tx, event_rx) = snapshot_channel::channel();
+    let app_for_consumer = app.clone();
+    let db_for_consumer = db.clone();
+
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                ClipboardListenerEvent::Content(snapshot) => {
+                    process_clipboard_snapshot(
+                        app_for_consumer.clone(),
+                        db_for_consumer.clone(),
+                        snapshot,
+                    )
+                    .await;
+                }
+                ClipboardListenerEvent::Cleared { sequence } => {
+                    process_clipboard_clear(
+                        app_for_consumer.clone(),
+                        db_for_consumer.clone(),
+                        sequence,
+                        FORGET_ON_CLEAR_ATTEMPTS,
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+        log::error!("CLIPBOARD: Native snapshot queue closed unexpectedly");
+    });
+
+    std::thread::Builder::new()
+        .name("cubby-clipboard-listener".to_string())
+        .spawn(move || run_native_listener(event_tx))
+        .unwrap_or_else(|error| panic!("failed to start native clipboard listener: {error}"));
+}
+
+type SourceAppInfo = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceAppIdentity {
+    process_id: u32,
+    is_explicit_owner: bool,
+}
+
+/// Resolve executable ownership while capturing, before queued work can outlive
+/// its source process or the PID can be reused. Decorative metadata is loaded
+/// later from this path, without reopening the process.
+#[derive(Default)]
+struct CapturedSourceApp {
+    identity: Option<SourceAppIdentity>,
+    exe_name: Option<String>,
+    full_path: Option<String>,
+}
+
+impl CapturedSourceApp {
+    fn is_rdp_owner(&self) -> bool {
+        is_rdp_client_owner(self.exe_name.as_deref(), self.is_explicit_owner())
+    }
+
+    fn is_explicit_owner(&self) -> bool {
+        self.identity.is_some_and(|owner| owner.is_explicit_owner)
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct RdpPollingState {
+    owner: Option<SourceAppIdentity>,
+    timed_out_sequence: Option<u32>,
+}
+
+#[cfg(target_os = "windows")]
+impl RdpPollingState {
+    fn observe(&mut self, notification: bool, sequence: u32, source: &CapturedSourceApp) {
+        if notification && self.timed_out_sequence != Some(sequence) {
+            self.timed_out_sequence = None;
+            self.owner = source.is_rdp_owner().then_some(source.identity).flatten();
+        } else if source.identity != self.owner {
+            self.owner = None;
+        }
+    }
+
+    fn record_attempt(&mut self, sequence: u32, attempt: CaptureAttempt) {
+        if matches!(
+            attempt,
+            CaptureAttempt::OwnerUnresponsive | CaptureAttempt::RetryBudgetExhausted
+        ) {
+            self.owner = None;
+            self.timed_out_sequence = Some(sequence);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+enum CaptureTrigger {
+    Notification,
+    RdpTextPoll(SourceAppIdentity),
+}
+
+#[cfg(target_os = "windows")]
+#[derive(PartialEq, Eq)]
+struct CaptureFingerprint {
+    sequence: u32,
+    owner: Option<SourceAppIdentity>,
+    hash: String,
+    sensitive: SensitiveMarkers,
+}
+
+#[cfg(target_os = "windows")]
+impl CaptureFingerprint {
+    fn metadata_matches(
+        &self,
+        observed_owner: Option<SourceAppIdentity>,
+        observed_sensitive: SensitiveMarkers,
+    ) -> bool {
+        self.owner == observed_owner && self.sensitive == observed_sensitive
+    }
+
+    fn should_queue_rdp_sample(
+        &self,
+        expected_owner: SourceAppIdentity,
+        observed_owner: Option<SourceAppIdentity>,
+        observed_sensitive: SensitiveMarkers,
+        last: Option<&Self>,
+    ) -> bool {
+        self.owner == Some(expected_owner)
+            && observed_owner == Some(expected_owner)
+            && self.metadata_matches(observed_owner, observed_sensitive)
+            && last != Some(self)
+    }
+}
+
+/// RDP's delayed text can change without a notification or sequence advance.
+/// Sample only after a new notification armed a known, actual RDP owner; never
+/// import a pre-existing clipboard at startup or repeatedly decode images.
+#[cfg(target_os = "windows")]
+const RDP_TEXT_POLL_INTERVAL: Duration = Duration::from_millis(40);
+
+struct ClipboardImageRead {
+    png_bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    raw_hash: String,
+    decode_ms: u128,
+    source_type: &'static str,
+}
+
+enum CapturedContent {
+    Text {
+        content: Vec<u8>,
+        preview: String,
+        hash: String,
+    },
+    Image {
+        png_bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+        hash: String,
+        decode_ms: u128,
+        source_type: &'static str,
+    },
+}
+
+struct ClipboardSnapshot {
+    sequence: u32,
+    source_app: Box<CapturedSourceApp>,
+    content: CapturedContent,
+    formats: Vec<CapturedFormat>,
+    materialize_ms: u128,
+    /// Which do-not-retain markers this copy carried. See `SensitiveMarkers`.
+    sensitive: SensitiveMarkers,
+    /// Ignore marker that was still live when this snapshot entered the queue.
+    /// Honoured at process time even if the wall-clock TTL has since elapsed
+    /// (SBS-1022). Carries the generation so consuming this echo cannot wipe
+    /// a later paste of the same content.
+    ignore: Option<ignore_hash::QueuedIgnore>,
+}
+
+enum ClipboardListenerEvent {
+    Content(ClipboardSnapshot),
+    /// Clipboard became empty (or empty-text) after a sequence advance.
+    Cleared {
+        sequence: u32,
+    },
+}
+
+impl SizedPayload for ClipboardListenerEvent {
+    fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Cleared { .. } => 0,
+            Self::Content(snapshot) => snapshot.payload_bytes(),
+        }
+    }
+
+    fn retain_on_flood(&self) -> bool {
+        matches!(self, Self::Cleared { .. })
+    }
+
+    fn replaces_queued(&self, older: &Self) -> bool {
+        matches!((self, older), (Self::Cleared { .. }, Self::Cleared { .. }))
+    }
+}
+
+impl ClipboardSnapshot {
+    /// Bytes that sit in RAM while this snapshot waits on the consumer.
+    /// HTML and RTF live in `formats`; PNG lives in `content`.
+    fn payload_bytes(&self) -> usize {
+        let content = match &self.content {
+            CapturedContent::Text {
+                content,
+                preview,
+                hash,
+            } => content.len() + preview.len() + hash.len(),
+            CapturedContent::Image {
+                png_bytes, hash, ..
+            } => png_bytes.len() + hash.len(),
+        };
+        let formats = self
+            .formats
+            .iter()
+            .map(|format| format.content.len())
+            .sum::<usize>();
+        content + formats
+    }
+}
+
+fn enqueue_listener_event(
+    event_tx: &snapshot_channel::Sender<ClipboardListenerEvent>,
+    event: ClipboardListenerEvent,
+) -> Result<(), ()> {
+    match event_tx.send(event, release_ignore_for_dropped_events) {
+        Ok(snapshot_queue::EnqueueOutcome::QueuedAfterDrop {
+            dropped,
+            dropped_bytes,
+            ..
+        }) => {
+            log::warn!(
+                "CLIPBOARD: Snapshot queue evicted {dropped} older pending capture(s) ({dropped_bytes} bytes) under flood (SBS-1032)"
+            );
+            Ok(())
+        }
+        Ok(snapshot_queue::EnqueueOutcome::Queued) => Ok(()),
+        Err(()) => Err(()),
+    }
+}
+
+/// Identity used for self-paste ignore. Must match process-time `clip_hash`
+/// so a flood-dropped echo consumes the same generation the paste path set.
+fn captured_clip_hash(content: &CapturedContent, formats: &[CapturedFormat]) -> String {
+    let (clip_type, primary) = match content {
+        CapturedContent::Text { content, .. } => ("text", content.as_slice()),
+        CapturedContent::Image { png_bytes, .. } => ("image", png_bytes.as_slice()),
+    };
+    // Stream the same identity as build_clip_hash_material without allocating
+    // and copying another combined text/HTML/RTF buffer for every RDP sample.
+    let mut hasher = Sha256::new();
+    hasher.update(clip_type.as_bytes());
+    hasher.update([0]);
+    hasher.update(primary);
+    if clip_type != "image" {
+        for format in formats {
+            hasher.update([0]);
+            hasher.update(format.name.as_bytes());
+            hasher.update([0]);
+            hasher.update(&format.content);
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// SBS-1039: a flood-evicted snapshot never reaches
+/// [`process_clipboard_snapshot`]. Consume a matching self-paste binding so
+/// IGNORE_HASH cannot keep suppressing later real copies. Unrelated dropped
+/// work (or a Cleared event) is left alone. LAST_STABLE_HASH is only written
+/// after persist, so a dropped snapshot never stamped consecutive-dedup and
+/// [`reset_capture_dedup`] is the history-delete path, not this one.
+fn release_ignore_for_dropped_events(evicted: &[ClipboardListenerEvent]) {
+    let mut lock = IGNORE_HASH.lock();
+    for event in evicted {
+        if let ClipboardListenerEvent::Content(snapshot) = event {
+            let clip_hash = captured_clip_hash(&snapshot.content, &snapshot.formats);
+            if lock.release_dropped_queued_work(snapshot.ignore.as_ref(), clip_hash.as_str()) {
+                log::info!(
+                    "CLIPBOARD: Released self-paste ignore after snapshot was dropped under flood (SBS-1039)"
+                );
+            }
+        }
+    }
+}
+
+/// Which do-not-retain markers the current clipboard contents carry.
+///
+/// Windows history honours three well-known formats (SBS-1002), and they do
+/// not mean the same thing once a remote session is in the path:
+/// - `ExcludeClipboardContentFromMonitorProcessing` — presence means skip
+/// - `Clipboard Viewer Ignore` — the KeePass 2.x convention
+/// - `CanIncludeInClipboardHistory` — a DWORD of 0 means skip
+///
+/// A remote-control viewer sets the first on *everything* it forwards, because
+/// it cannot know what the far-end application meant. Honoring that dropped
+/// every remote-session copy and left a hole in history that reads as lost
+/// data (SBS-781). Windows RDP also adds `CanIncludeInClipboardHistory = 0`
+/// together with `CanUploadToCloudClipboard = 0` to ordinary redirected text.
+/// Those transport tags cannot identify an originating application's intent.
+/// `Clipboard Viewer Ignore` remains an explicit content exclusion, including
+/// when forwarded through RDP (SBS-1000).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SensitiveMarkers {
+    /// `ExcludeClipboardContentFromMonitorProcessing`. A blanket tag: trusted
+    /// from a local application, not from a viewer relaying someone else's
+    /// clipboard.
+    monitor_exclusion: bool,
+    /// `Clipboard Viewer Ignore`, an explicit content exclusion.
+    content_owner: bool,
+    /// `CanIncludeInClipboardHistory` = 0. Also synthesized by Windows RDP.
+    history_exclusion: bool,
+    /// `CanUploadToCloudClipboard` = 0. The paired RDP transport marker.
+    cloud_exclusion: bool,
+}
+
+impl SensitiveMarkers {
+    /// Any marker at all. Drives the marker Cubby re-applies when it rewrites
+    /// the clipboard, which must not silently drop a tag that was there.
+    fn any(self) -> bool {
+        self.monitor_exclusion
+            || self.content_owner
+            || self.history_exclusion
+            || self.cloud_exclusion
+    }
+}
+
+/// Presence is authoritative for monitor/viewer exclusions. DWORD values are
+/// read through the bounded OLE worker; an unreadable value is an error, never
+/// permission to retain or relay a potentially excluded copy.
+#[cfg(target_os = "windows")]
+fn clipboard_marked_sensitive() -> Result<SensitiveMarkers, crate::clipboard_reader::ReadFailure> {
+    let mut markers = SensitiveMarkers {
+        monitor_exclusion: clipboard_format_available(
+            "ExcludeClipboardContentFromMonitorProcessing",
+        ),
+        content_owner: clipboard_format_available("Clipboard Viewer Ignore"),
+        ..Default::default()
+    };
+    if !clipboard_format_available("CanIncludeInClipboardHistory")
+        && !clipboard_format_available("CanUploadToCloudClipboard")
+    {
+        return Ok(markers);
+    }
+    crate::clipboard_reader::with_reader(move |reader| {
+        markers.history_exclusion =
+            clipboard_dword_opted_out(reader, "CanIncludeInClipboardHistory")?;
+        markers.cloud_exclusion = clipboard_dword_opted_out(reader, "CanUploadToCloudClipboard")?;
+        Ok::<_, String>(markers)
+    })?
+    .0
+    .map_err(crate::clipboard_reader::ReadFailure::Failed)
+}
+
+#[cfg(target_os = "windows")]
+fn capture_sensitive_markers(sequence: u32) -> Result<SensitiveMarkers, CaptureAttempt> {
+    retry_sensitive_markers(clipboard_marked_sensitive, std::thread::sleep).map_err(|error| match error {
+        crate::clipboard_reader::ReadFailure::Unresponsive => {
+            note_clipboard_event(sequence);
+            record_capture_error(format!("clipboard owner did not render privacy markers for sequence {sequence} within 30 s; that copy was not captured"));
+            CaptureAttempt::OwnerUnresponsive
+        }
+        crate::clipboard_reader::ReadFailure::Failed(_) =>
+            defer_or_exhaust_capture(sequence, "privacy markers were unreadable"),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn retry_sensitive_markers(
+    mut read: impl FnMut() -> Result<SensitiveMarkers, crate::clipboard_reader::ReadFailure>,
+    mut pause: impl FnMut(Duration),
+) -> Result<SensitiveMarkers, crate::clipboard_reader::ReadFailure> {
+    for attempt in 0..10 {
+        match read() {
+            Err(crate::clipboard_reader::ReadFailure::Failed(_)) if attempt + 1 < 10 => {
+                pause(clipboard_retry_delay(attempt))
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt always returns")
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_format_available(name: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::DataExchange::{
+        IsClipboardFormatAvailable, RegisterClipboardFormatW,
+    };
+
+    let utf16: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let format = unsafe { RegisterClipboardFormatW(PCWSTR(utf16.as_ptr())) };
+    format != 0 && unsafe { IsClipboardFormatAvailable(format) }.is_ok()
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_dword_opted_out(
+    reader: &crate::clipboard_reader::Reader,
+    name: &str,
+) -> Result<bool, String> {
+    let format = register_clipboard_format(name);
+    if format == 0 {
+        return Err("could not register clipboard privacy format".into());
+    }
+    if !crate::clipboard_reader::available(format) {
+        return Ok(false);
+    }
+    decode_privacy_dword(&reader.bytes(format)?)
+}
+
+#[cfg(target_os = "windows")]
+fn decode_privacy_dword(bytes: &[u8]) -> Result<bool, String> {
+    let value = bytes
+        .get(..4)
+        .ok_or("clipboard privacy DWORD was unreadable")?;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()) == 0)
+}
+
+pub(crate) struct CapturedFormat {
+    pub(crate) name: &'static str,
+    pub(crate) content: Vec<u8>,
+}
+
+#[cfg(target_os = "windows")]
+enum ListenerSessionExit {
+    /// Snapshot consumer dropped — app is shutting down; do not restart.
+    ConsumerGone,
+    /// Watchdog or explicit shutdown asked us to recreate the monitor.
+    RestartRequested,
+    /// Win32 / monitor failure; recreate after backoff.
+    Failed(String),
+}
+
+#[cfg(target_os = "windows")]
+fn request_listener_restart(reason: &str) {
+    log::warn!("CLIPBOARD: Requesting listener restart ({reason})");
+    if let Some(shutdown) = LISTENER_SHUTDOWN.lock().take() {
+        drop(shutdown);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_listener_watchdog() {
+    static WATCHDOG_STARTED: AtomicU8 = AtomicU8::new(0);
+    if WATCHDOG_STARTED.swap(1, Ordering::SeqCst) != 0 {
+        return;
+    }
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("cubby-clipboard-watchdog".to_string())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(WATCHDOG_INTERVAL);
+                if CAPTURE_STATE.load(Ordering::SeqCst) != CAPTURE_STATE_LISTENING {
+                    continue;
+                }
+
+                let current_sequence = unsafe {
+                    windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
+                };
+                let handled = LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst);
+                if current_sequence == handled {
+                    continue;
+                }
+
+                let last_event_ms = LAST_CLIPBOARD_EVENT_UNIX_MS.load(Ordering::SeqCst);
+                let now_ms = unix_now_ms();
+                let stale_for_ms = now_ms.saturating_sub(last_event_ms);
+                if stale_for_ms < STALE_LISTENER_AFTER.as_millis() as u64 {
+                    continue;
+                }
+
+                // Sequence advanced without a WM_CLIPBOARDUPDATE reaching us —
+                // typical after sleep/resume or Explorer restarts when the listener
+                // HWND is still "alive" but no longer receiving updates.
+                request_listener_restart(&format!(
+                    "watchdog: sequence {current_sequence} ahead of handled {handled} for {stale_for_ms}ms"
+                ));
+            }
+        })
+    {
+        log::error!("CLIPBOARD: Failed to start listener watchdog: {error}");
+    }
+}
+
+/// Outcome of trying to ingest the clipboard for one sequence number.
+#[cfg(target_os = "windows")]
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureAttempt {
+    /// A snapshot or clear event was queued (or the payload is unsupported);
+    /// the sequence was marked handled.
+    Handled,
+    /// Supported content is present but every clipboard open lost the race.
+    /// The sequence stays unhandled so the watchdog retries it.
+    Deferred,
+    /// A delayed-render owner timed out. Do not sample it again until Windows
+    /// announces another copy, which may belong to a responsive owner.
+    OwnerUnresponsive,
+    RetryBudgetExhausted,
+}
+
+/// How many times one capture may restart after the clipboard sequence moves
+/// mid-read. Each restart re-collects metadata and payload together.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const MAX_SEQUENCE_BIND_ATTEMPTS: u32 = 3;
+
+/// The clipboard advanced while this capture was still reading. Metadata from
+/// the old sequence must not be paired with the new payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequenceBindError {
+    Changed { from: u32, to: u32 },
+}
+
+/// Source/sensitivity collected before the payload is materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct CapturePrivacyMetadata {
+    sensitive: bool,
+}
+
+/// One capture whose metadata and payload were read under the same sequence.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum SequenceBoundCapture<T> {
+    Bound {
+        sequence: u32,
+        metadata: CapturePrivacyMetadata,
+        payload: T,
+    },
+    Changed {
+        from: u32,
+        to: u32,
+    },
+}
+
+/// Collect metadata, then payload, and keep the pair only if the clipboard
+/// sequence never moved. This is the test seam for SBS-767.
+#[cfg_attr(not(test), allow(dead_code))]
+fn bind_capture_to_sequence<S, M, P, T>(
+    read_sequence: S,
+    collect_metadata: M,
+    collect_payload: P,
+) -> SequenceBoundCapture<T>
+where
+    S: Fn() -> u32,
+    M: FnOnce() -> CapturePrivacyMetadata,
+    P: FnOnce() -> T,
+{
+    let start = read_sequence();
+    let metadata = collect_metadata();
+    let after_metadata = read_sequence();
+    if after_metadata != start {
+        return SequenceBoundCapture::Changed {
+            from: start,
+            to: after_metadata,
+        };
+    }
+    let payload = collect_payload();
+    let after_payload = read_sequence();
+    if after_payload != start {
+        return SequenceBoundCapture::Changed {
+            from: start,
+            to: after_payload,
+        };
+    }
+    SequenceBoundCapture::Bound {
+        sequence: start,
+        metadata,
+        payload,
+    }
+}
+
+/// Persist only when the sequence is still the one we bound. A later copy must
+/// not inherit this snapshot's privacy flags.
+fn persist_if_sequence_holds<T>(
+    expected: u32,
+    current: u32,
+    snapshot: T,
+) -> Result<T, SequenceBindError> {
+    if current == expected {
+        Ok(snapshot)
+    } else {
+        Err(SequenceBindError::Changed {
+            from: expected,
+            to: current,
+        })
+    }
+}
+
+/// Retry a delayed materialize, but abort as soon as the sequence moves so a
+/// later (possibly sensitive) payload is never kept with earlier metadata.
+///
+/// `attempt` also returns the sequence it saw right after its last clipboard
+/// read. If that still equals `expected`, every read came from that one copy.
+/// A copy that lands afterwards has its own notification; checking the live
+/// sequence here instead discarded payloads read correctly, and Excel starts
+/// the next queued copy the moment it finishes rendering the last format.
+fn materialize_with_sequence_guard<F, T>(
+    expected: u32,
+    read_sequence: impl Fn() -> u32,
+    mut attempt: F,
+    max_attempts: u32,
+) -> Result<Option<T>, SequenceBindError>
+where
+    F: FnMut(u32) -> Option<(T, u32)>,
+{
+    for index in 0..max_attempts {
+        let current = read_sequence();
+        if current != expected {
+            return Err(SequenceBindError::Changed {
+                from: expected,
+                to: current,
+            });
+        }
+        if let Some((value, after_reads)) = attempt(index) {
+            if after_reads != expected {
+                return Err(SequenceBindError::Changed {
+                    from: expected,
+                    to: after_reads,
+                });
+            }
+            return Ok(Some(value));
+        }
+    }
+    let current = read_sequence();
+    if current != expected {
+        return Err(SequenceBindError::Changed {
+            from: expected,
+            to: current,
+        });
+    }
+    Ok(None)
+}
+
+/// Try to materialize and queue the clipboard content behind `sequence`.
+///
+/// The sequence is marked handled only after a successful materialize (or a
+/// confirmed clear / unsupported payload). A contended read leaves it
+/// unhandled: the watchdog then sees it stale after [`STALE_LISTENER_AFTER`]
+/// and restarts the listener, whose session start retries this capture instead
+/// of silently dropping the copy.
+///
+/// Count a deferral against `sequence` and decide whether it earns another try.
+///
+/// Returns the attempt count to remember, and `Handled` once the sequence has
+/// used up `max_attempts`. Without that ceiling a clipboard owner that never
+/// releases the lock keeps the sequence permanently unhandled, and the watchdog
+/// restarts the listener every few seconds for the rest of the session.
+#[cfg(target_os = "windows")]
+fn deferral_decision(
+    tracked_sequence: u32,
+    tracked_attempts: u32,
+    sequence: u32,
+    max_attempts: u32,
+) -> (u32, CaptureAttempt) {
+    let attempts = if tracked_sequence == sequence {
+        tracked_attempts.saturating_add(1)
+    } else {
+        // A different copy: this one starts its own budget.
+        1
+    };
+
+    if attempts >= max_attempts {
+        (attempts, CaptureAttempt::Handled)
+    } else {
+        (attempts, CaptureAttempt::Deferred)
+    }
+}
+
+/// `Err(())` means the snapshot consumer is gone (process teardown).
+#[cfg(target_os = "windows")]
+fn capture_clipboard_update(
+    mut sequence: u32,
+    event_tx: &snapshot_channel::Sender<ClipboardListenerEvent>,
+    trigger: CaptureTrigger,
+    last_capture: &mut Option<CaptureFingerprint>,
+) -> Result<CaptureAttempt, ()> {
+    let read_sequence =
+        || unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+
+    for bind_attempt in 0..MAX_SEQUENCE_BIND_ATTEMPTS {
+        match capture_one_bound_sequence(sequence, &read_sequence, event_tx, trigger, last_capture)
+        {
+            Ok(attempt) => return Ok(attempt),
+            Err(BoundCaptureFailure::ConsumerGone) => return Err(()),
+            Err(BoundCaptureFailure::Sequence(SequenceBindError::Changed { from, to })) => {
+                log::debug!(
+                    "CLIPBOARD: Sequence changed {from} -> {to} during capture (bind attempt {}); retrying from metadata",
+                    bind_attempt + 1
+                );
+                // The clipboard now belongs to a newer copy. Bind the next
+                // attempt to that sequence rather than the stale event number.
+                sequence = to;
+            }
+        }
+    }
+
+    // Do not mark `current` handled: the change that outran this capture has
+    // its own WM_CLIPBOARDUPDATE queued, and the duplicate-sequence guard
+    // would skip it. Excel publishes ~30 sequence steps in under a millisecond,
+    // so this happens on ordinary copies. The listener is still alive, so keep
+    // the watchdog from restarting it; it still catches a lost notification.
+    LAST_CLIPBOARD_EVENT_UNIX_MS.store(unix_now_ms(), Ordering::SeqCst);
+    let current = read_sequence();
+    log::debug!(
+        "CLIPBOARD: Sequence {} kept changing during capture; waiting for its notification",
+        current
+    );
+    Ok(CaptureAttempt::Handled)
+}
+
+#[cfg(target_os = "windows")]
+enum BoundCaptureFailure {
+    Sequence(SequenceBindError),
+    ConsumerGone,
+}
+
+#[cfg(target_os = "windows")]
+impl From<SequenceBindError> for BoundCaptureFailure {
+    fn from(error: SequenceBindError) -> Self {
+        Self::Sequence(error)
+    }
+}
+
+/// One metadata-then-payload read, kept only if the sequence stays put.
+#[cfg(target_os = "windows")]
+fn capture_one_bound_sequence(
+    mut sequence: u32,
+    read_sequence: &impl Fn() -> u32,
+    event_tx: &snapshot_channel::Sender<ClipboardListenerEvent>,
+    trigger: CaptureTrigger,
+    last_capture: &mut Option<CaptureFingerprint>,
+) -> Result<CaptureAttempt, BoundCaptureFailure> {
+    let started = Instant::now();
+    let live = read_sequence();
+    if live != sequence {
+        // The event sequence is already stale. Capture whatever is current.
+        sequence = live;
+    }
+
+    // Delayed rendering can enqueue more notifications while this thread is
+    // materializing. A notification is not a new copy: do not reopen a sequence
+    // whose snapshot was already queued. Never suppress unknown sequence zero.
+    if matches!(trigger, CaptureTrigger::Notification)
+        && sequence != 0
+        && sequence == LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst)
+    {
+        return Ok(CaptureAttempt::Handled);
+    }
+
+    if let CaptureTrigger::RdpTextPoll(owner) = trigger {
+        if get_clipboard_owner_identity() != Some(owner)
+            || !clipboard_has_unicode_text_format()
+            || clipboard_has_image_format()
+            || clipboard_has_file_payload_format()
+        {
+            return Ok(CaptureAttempt::Handled);
+        }
+    }
+
+    // Excel closes an empty clipboard before publishing its new formats. Do
+    // not compete with that publication by opening it to discover it is empty.
+    // Keep the existing sequence-bound clear event (password auto-clear).
+    if clipboard_format_count_is_zero() && !clipboard_has_supported_format() {
+        persist_if_sequence_holds(sequence, read_sequence(), ())?;
+        note_clipboard_event(sequence);
+        return enqueue_listener_event(event_tx, ClipboardListenerEvent::Cleared { sequence })
+            .map(|_| CaptureAttempt::Handled)
+            .map_err(|_| BoundCaptureFailure::ConsumerGone);
+    }
+
+    // File clipboard payloads are references to external paths, not durable
+    // clipboard content. Recording them as history creates entries that can
+    // silently stop working after a move, disconnect, or target-app mismatch.
+    // Ignore both physical and virtual file payloads before reading any text
+    // fallback they may advertise. Screenshot tools are the exception: they
+    // intentionally add CF_HDROP beside real image data, which Cubby retains
+    // as an image rather than as an unreliable file reference.
+    let has_file_payload = clipboard_has_file_payload_format();
+    let has_image_payload = clipboard_has_image_format();
+    let source_app_identity = get_clipboard_owner_identity();
+    let source_app = capture_source_app(source_app_identity);
+    let rdp_owner = source_app.is_rdp_owner();
+    let sensitive = match capture_sensitive_markers(sequence) {
+        Ok(markers) => markers,
+        Err(attempt) => return Ok(attempt),
+    };
+    let after_metadata = read_sequence();
+    if after_metadata != sequence {
+        return Err(SequenceBindError::Changed {
+            from: sequence,
+            to: after_metadata,
+        }
+        .into());
+    }
+
+    if crate::clipboard_policy::classify_file_payload(has_file_payload, has_image_payload)
+        == crate::clipboard_policy::FilePayloadPolicy::IgnoreFilePayload
+    {
+        note_clipboard_event(sequence);
+        log::debug!(
+            "CLIPBOARD: Sequence {} contained a file payload; intentionally ignoring it",
+            sequence
+        );
+        return Ok(CaptureAttempt::Handled);
+    }
+
+    if !clipboard_has_supported_format() {
+        persist_if_sequence_holds(sequence, read_sequence(), ())?;
+        note_clipboard_event(sequence);
+        return Ok(CaptureAttempt::Handled);
+    }
+
+    let materialized = materialize_with_sequence_guard(
+        sequence,
+        read_sequence,
+        |attempt| {
+            let (outcome, after_reads) = materialize_clipboard_content_once(attempt, rdp_owner);
+            let decided = match outcome {
+                MaterializeOnce::Captured(content, formats) => {
+                    MaterializeAttempt::Captured(content, formats)
+                }
+                MaterializeOnce::DeterminateMiss => MaterializeAttempt::DeterminateMiss,
+                MaterializeOnce::Unresponsive => MaterializeAttempt::Unresponsive,
+                MaterializeOnce::Transient => {
+                    if attempt + 1 < 10 {
+                        std::thread::sleep(clipboard_retry_delay(attempt));
+                    }
+                    return None;
+                }
+            };
+            Some((decided, after_reads))
+        },
+        10,
+    )?;
+
+    if let Some(MaterializeAttempt::Captured(content, formats)) = materialized {
+        let fingerprint = CaptureFingerprint {
+            sequence,
+            owner: source_app_identity,
+            hash: captured_clip_hash(&content, &formats),
+            sensitive,
+        };
+        // RDP can change data and privacy markers without advancing the
+        // sequence. Validate notifications too, not just later samples.
+        if rdp_owner {
+            let observed_sensitive = match capture_sensitive_markers(sequence) {
+                Ok(markers) => markers,
+                Err(attempt) => return Ok(attempt),
+            };
+            if !fingerprint.metadata_matches(get_clipboard_owner_identity(), observed_sensitive) {
+                return Ok(CaptureAttempt::Deferred);
+            }
+        }
+        // A sequence may represent many RDP copies. Count consecutive failed
+        // reads, not unrelated contention episodes across successful samples.
+        reset_capture_deferrals(&DEFERRED_SEQUENCE, &DEFERRED_ATTEMPTS, sequence);
+        if let CaptureTrigger::RdpTextPoll(owner) = trigger {
+            if !matches!(&content, CapturedContent::Text { .. })
+                || !rdp_owner
+                || !fingerprint.should_queue_rdp_sample(
+                    owner,
+                    source_app_identity,
+                    sensitive,
+                    last_capture.as_ref(),
+                )
+            {
+                return Ok(CaptureAttempt::Handled);
+            }
+        }
+        // The guard proved every read came from `sequence`. Queue it even if a
+        // newer copy has landed since; that copy is captured on its own.
+        note_clipboard_event(sequence);
+        // Bind the live marker onto this work item (SBS-1022). If flood
+        // policy later evicts it, enqueue_listener_event must release that
+        // binding (SBS-1039) so IGNORE_HASH cannot keep swallowing copies.
+        let ignore = bind_ignore_hash_for_queued_work(
+            IGNORE_HASH.lock().marker.as_ref(),
+            Instant::now(),
+            IGNORE_HASH_TTL,
+        );
+        let snapshot = ClipboardSnapshot {
+            sequence,
+            source_app: Box::new(source_app),
+            content,
+            formats,
+            materialize_ms: started.elapsed().as_millis(),
+            sensitive,
+            ignore,
+        };
+        enqueue_listener_event(event_tx, ClipboardListenerEvent::Content(snapshot))
+            .map_err(|_| BoundCaptureFailure::ConsumerGone)?;
+        *last_capture = Some(fingerprint);
+        return Ok(CaptureAttempt::Handled);
+    }
+
+    persist_if_sequence_holds(sequence, read_sequence(), ())?;
+
+    if matches!(materialized, Some(MaterializeAttempt::Unresponsive)) {
+        // Each retry would wait out the same 30 s. Later copies get a fresh
+        // reader thread, so capture continues while this owner stays hung.
+        note_clipboard_event(sequence);
+        record_capture_error(format!(
+            "clipboard owner did not render sequence {sequence} within 30 s; that copy was not captured"
+        ));
+        return Ok(CaptureAttempt::OwnerUnresponsive);
+    }
+
+    if matches!(materialized, Some(MaterializeAttempt::DeterminateMiss)) {
+        // Opened the clipboard and read empty/missing text with no HTML/RTF
+        // and no image. That is not a lock, even when CF_UNICODETEXT is still
+        // advertised (SBS-924).
+        if clipboard_is_cleared() {
+            persist_if_sequence_holds(sequence, read_sequence(), ())?;
+            note_clipboard_event(sequence);
+            return enqueue_listener_event(event_tx, ClipboardListenerEvent::Cleared { sequence })
+                .map(|_| CaptureAttempt::Handled)
+                .map_err(|_| BoundCaptureFailure::ConsumerGone);
+        }
+        persist_if_sequence_holds(sequence, read_sequence(), ())?;
+        note_clipboard_event(sequence);
+        log::debug!(
+            "CLIPBOARD: Sequence {} contained no supported text or image payload",
+            sequence
+        );
+        return Ok(CaptureAttempt::Handled);
+    }
+
+    if has_file_payload && has_image_payload {
+        // The hybrid image was advertised but remained unreadable after all
+        // bounded attempts. Do not fall through to its path-like text or keep
+        // restarting the listener forever for malformed image data.
+        note_clipboard_event(sequence);
+        log::warn!(
+            "CLIPBOARD: Sequence {} advertised a file-backed image but its image data was unreadable",
+            sequence
+        );
+        return Ok(CaptureAttempt::Handled);
+    }
+
+    if clipboard_is_cleared() {
+        persist_if_sequence_holds(sequence, read_sequence(), ())?;
+        // Empty clipboard (or empty text with no image/files). This is
+        // the password-manager auto-clear signal; never treat a new
+        // non-empty copy as a clear.
+        note_clipboard_event(sequence);
+        return enqueue_listener_event(event_tx, ClipboardListenerEvent::Cleared { sequence })
+            .map(|_| CaptureAttempt::Handled)
+            .map_err(|_| BoundCaptureFailure::ConsumerGone);
+    }
+
+    if clipboard_has_supported_format() {
+        persist_if_sequence_holds(sequence, read_sequence(), ())?;
+        return Ok(defer_or_exhaust_capture(
+            sequence,
+            "clipboard stayed contended",
+        ));
+    }
+
+    persist_if_sequence_holds(sequence, read_sequence(), ())?;
+    // Nothing we support (custom/private formats only). Mark handled so the
+    // watchdog does not treat an ignored format as a dead listener.
+    note_clipboard_event(sequence);
+    log::debug!(
+        "CLIPBOARD: Sequence {} contained no supported text or image payload",
+        sequence
+    );
+    Ok(CaptureAttempt::Handled)
+}
+
+#[cfg(target_os = "windows")]
+fn reset_capture_deferrals(sequence: &AtomicU32, attempts: &AtomicU32, current: u32) {
+    sequence.store(current, Ordering::SeqCst);
+    attempts.store(0, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+fn defer_or_exhaust_capture(sequence: u32, reason: &str) -> CaptureAttempt {
+    let (attempts, decision) = deferral_decision(
+        DEFERRED_SEQUENCE.load(Ordering::SeqCst),
+        DEFERRED_ATTEMPTS.load(Ordering::SeqCst),
+        sequence,
+        MAX_DEFERRALS_PER_SEQUENCE,
+    );
+    DEFERRED_SEQUENCE.store(sequence, Ordering::SeqCst);
+    DEFERRED_ATTEMPTS.store(attempts, Ordering::SeqCst);
+    if decision == CaptureAttempt::Deferred {
+        log::warn!("CLIPBOARD: Sequence {sequence} deferred: {reason} (attempt {attempts} of {MAX_DEFERRALS_PER_SEQUENCE})");
+        return decision;
+    }
+    note_clipboard_event(sequence);
+    record_capture_error(format!("clipboard sequence {sequence}: {reason} across {attempts} attempts; that copy was not captured"));
+    CaptureAttempt::RetryBudgetExhausted
+}
+
+/// True when the clipboard advertises a format `materialize_clipboard_content_once`
+/// can read (text or an image). Used to tell "unsupported payload"
+/// (mark handled) apart from "supported but contended" (defer and retry).
+///
+/// Advertised `CF_UNICODETEXT` is not enough after a determinate empty-text
+/// read: that payload is empty, not locked (SBS-924). Callers that already
+/// opened the clipboard and read empty text must not use this as a lock signal.
+#[cfg(target_os = "windows")]
+fn clipboard_has_supported_format() -> bool {
+    clipboard_has_unicode_text_format()
+        || clipboard_has_html_format()
+        || clipboard_has_rtf_format()
+        || clipboard_has_image_format()
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_has_file_payload_format() -> bool {
+    use std::sync::OnceLock;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::DataExchange::{
+        IsClipboardFormatAvailable, RegisterClipboardFormatW,
+    };
+
+    const CF_HDROP: u32 = 15;
+    if unsafe { IsClipboardFormatAvailable(CF_HDROP) }.is_ok() {
+        return true;
+    }
+
+    // OLE virtual files (for example Outlook attachments) do not necessarily
+    // expose CF_HDROP. Their descriptors still identify the update as a file
+    // payload, which Cubby deliberately does not present as durable history.
+    static VIRTUAL_FILE_FORMATS: OnceLock<[u32; 3]> = OnceLock::new();
+    VIRTUAL_FILE_FORMATS
+        .get_or_init(|| {
+            [
+                "FileGroupDescriptor",
+                "FileGroupDescriptorW",
+                "FileContents",
+            ]
+            .map(|format_name| {
+                let name: Vec<u16> = format_name
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                unsafe { RegisterClipboardFormatW(PCWSTR(name.as_ptr())) }
+            })
+        })
+        .iter()
+        .copied()
+        .any(|format| format != 0 && unsafe { IsClipboardFormatAvailable(format) }.is_ok())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_has_file_payload_format() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn register_clipboard_format(name: &str) -> u32 {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) }
+}
+
+#[cfg(target_os = "windows")]
+fn registered_png_format() -> u32 {
+    static PNG_FORMAT: OnceLock<u32> = OnceLock::new();
+    *PNG_FORMAT.get_or_init(|| register_clipboard_format("PNG"))
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_has_image_format() -> bool {
+    use windows::Win32::System::DataExchange::IsClipboardFormatAvailable;
+
+    if crate::clipboard_policy::PREDEFINED_IMAGE_FORMATS
+        .into_iter()
+        .any(|(_, format)| unsafe { IsClipboardFormatAvailable(format) }.is_ok())
+    {
+        return true;
+    }
+
+    registered_image_formats()
+        .iter()
+        .any(|format| *format != 0 && unsafe { IsClipboardFormatAvailable(*format) }.is_ok())
+}
+
+/// Identifiers for [`crate::clipboard_policy::REGISTERED_IMAGE_FORMATS`],
+/// resolved once because this runs on the capture path.
+#[cfg(target_os = "windows")]
+fn registered_image_formats() -> &'static [u32] {
+    static FORMATS: OnceLock<Vec<u32>> = OnceLock::new();
+    FORMATS.get_or_init(|| {
+        crate::clipboard_policy::REGISTERED_IMAGE_FORMATS
+            .into_iter()
+            .map(register_clipboard_format)
+            .collect()
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_has_image_format() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn run_listener_session(
+    monitor: &mut Monitor,
+    event_tx: &snapshot_channel::Sender<ClipboardListenerEvent>,
+    last_capture: &mut Option<CaptureFingerprint>,
+    polling: &mut RdpPollingState,
+) -> ListenerSessionExit {
+    loop {
+        // try_recv discards shutdown messages. Check this even after ownership
+        // changed back to a local application, before blocking in recv again.
+        if LISTENER_SHUTDOWN.lock().is_none() {
+            return ListenerSessionExit::RestartRequested;
+        }
+        let notification = if polling.owner.is_some() {
+            // try_recv ignores the monitor's shutdown message. The supervisor
+            // clears this slot before dropping its shutdown handle, so retain
+            // the watchdog's restart signal even while sampling RDP text.
+            match monitor.try_recv() {
+                Ok(received) => received,
+                Err(error) => return ListenerSessionExit::Failed(error.to_string()),
+            }
+        } else {
+            match monitor.recv() {
+                Ok(true) => true,
+                Ok(false) => return ListenerSessionExit::RestartRequested,
+                Err(error) => return ListenerSessionExit::Failed(error.to_string()),
+            }
+        };
+
+        let sequence =
+            unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        let owner = get_clipboard_owner_identity();
+        if notification {
+            polling.observe(true, sequence, &capture_source_app(owner));
+        } else if owner != polling.owner {
+            // A local application took ownership; return to event-driven reads.
+            polling.owner = None;
+        }
+
+        let trigger = if notification {
+            CaptureTrigger::Notification
+        } else if let Some(owner) = polling.owner {
+            CaptureTrigger::RdpTextPoll(owner)
+        } else {
+            continue;
+        };
+        match capture_clipboard_update(sequence, event_tx, trigger, last_capture) {
+            Err(()) => return ListenerSessionExit::ConsumerGone,
+            Ok(attempt) => {
+                polling.record_attempt(LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst), attempt)
+            }
+        }
+        if polling.owner.is_some() {
+            std::thread::sleep(RDP_TEXT_POLL_INTERVAL);
+        }
+    }
+}
+
+/// True when the clipboard is empty or only holds empty text (and no image/files).
+/// Returns false when the clipboard cannot be opened (contention) so we never
+/// treat a lock miss as an auto-clear.
+fn clipboard_is_cleared() -> bool {
+    if clipboard_format_count_is_zero() {
+        return true;
+    }
+    if !clipboard_only_has_placeholder_text_formats() {
+        return false;
+    }
+    // The only remaining candidate is empty text. Never render images or rich
+    // formats merely to decide whether a clipboard with those formats is empty.
+    #[cfg(target_os = "windows")]
+    return crate::clipboard_reader::with_reader(|reader| reader.text())
+        .is_ok_and(|(text, _)| text.is_ok_and(|text| text.is_empty()));
+    #[cfg(not(target_os = "windows"))]
+    ClipboardContext::new()
+        .and_then(|ctx| ctx.get_text())
+        .is_ok_and(|text| text.is_empty())
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_format_count_is_zero() -> bool {
+    crate::clipboard_reader::is_empty()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_format_count_is_zero() -> bool {
+    true
+}
+
+/// True when every format currently on the clipboard is one of the text
+/// placeholders Windows keeps or synthesizes for an empty-text write
+/// (CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT, CF_LOCALE). A private/custom format
+/// alongside them means an app copied real content we simply cannot read.
+#[cfg(target_os = "windows")]
+fn clipboard_only_has_placeholder_text_formats() -> bool {
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EnumClipboardFormats, OpenClipboard,
+    };
+
+    const CF_TEXT: u32 = 1;
+    const CF_OEMTEXT: u32 = 7;
+    const CF_UNICODETEXT: u32 = 13;
+    const CF_LOCALE: u32 = 16;
+
+    if unsafe { OpenClipboard(None) }.is_err() {
+        // Contention: never treat an unreadable clipboard as a clear.
+        return false;
+    }
+    let mut only_placeholders = true;
+    let mut format = unsafe { EnumClipboardFormats(0) };
+    while format != 0 {
+        if !matches!(format, CF_TEXT | CF_OEMTEXT | CF_UNICODETEXT | CF_LOCALE) {
+            only_placeholders = false;
+            break;
+        }
+        format = unsafe { EnumClipboardFormats(format) };
+    }
+    let _ = unsafe { CloseClipboard() };
+    only_placeholders
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_only_has_placeholder_text_formats() -> bool {
+    true
+}
+
+/// Supervise the native clipboard listener so capture never silently stops.
+///
+/// Tradeoffs (SOU-218):
+/// - Forever-restart + capped backoff prefers availability over giving up.
+/// - Watchdog recreates the monitor when the clipboard sequence advances but no
+///   event arrives for [`STALE_LISTENER_AFTER`]. Capture can lag up to ~5–7s
+///   after a silent death (sleep/Explorer), but avoids power-session Win32
+///   surface area and toast spam.
+/// - Every session start after the first catches up on a sequence the previous
+///   session missed (restart window) or deferred (contended materialize), so
+///   those copies are ingested late rather than lost.
+/// - Consumer channel close stops the supervisor (process teardown).
+#[cfg(target_os = "windows")]
+fn run_native_listener(event_tx: snapshot_channel::Sender<ClipboardListenerEvent>) {
+    spawn_listener_watchdog();
+
+    let mut backoff = INITIAL_LISTENER_BACKOFF;
+    let mut first_session = true;
+    let mut last_capture = None;
+    // A monitor restart replaces the message window, not the last observed
+    // clipboard owner. Preserve sampling and timeout disarm across sessions.
+    let mut polling = RdpPollingState::default();
+    loop {
+        set_capture_state(CAPTURE_STATE_RESTARTING);
+
+        let mut monitor = match Monitor::new() {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                record_capture_error(format!("failed to create native listener: {error}"));
+                std::thread::sleep(backoff);
+                backoff = next_listener_backoff(backoff);
+                continue;
+            }
+        };
+
+        {
+            let mut slot = LISTENER_SHUTDOWN.lock();
+            *slot = Some(monitor.shutdown_channel());
+        }
+
+        let current_sequence =
+            unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        if first_session {
+            // Don't ingest whatever was on the clipboard before Cubby started;
+            // only copies made while running belong in history.
+            note_clipboard_event(current_sequence);
+            first_session = false;
+        } else if current_sequence != LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst) {
+            // A copy landed while the listener was down, or a previous
+            // materialize was deferred under contention. Catch up now instead
+            // of stamping the sequence handled and losing the copy.
+            log::info!(
+                "CLIPBOARD: Catching up on clipboard sequence {} missed during listener restart",
+                current_sequence
+            );
+            polling.observe(
+                true,
+                current_sequence,
+                &capture_source_app(get_clipboard_owner_identity()),
+            );
+            match capture_clipboard_update(
+                current_sequence,
+                &event_tx,
+                CaptureTrigger::Notification,
+                &mut last_capture,
+            ) {
+                Ok(attempt) => {
+                    polling.record_attempt(LAST_HANDLED_SEQUENCE.load(Ordering::SeqCst), attempt)
+                }
+                Err(()) => {
+                    record_capture_error("snapshot consumer stopped; capture supervisor exiting");
+                    set_capture_state(CAPTURE_STATE_STOPPED);
+                    return;
+                }
+            }
+        }
+        set_capture_state(CAPTURE_STATE_LISTENING);
+        log::info!("CLIPBOARD: Native WM_CLIPBOARDUPDATE listener started");
+
+        let exit = run_listener_session(&mut monitor, &event_tx, &mut last_capture, &mut polling);
+        *LISTENER_SHUTDOWN.lock() = None;
+        drop(monitor);
+
+        match exit {
+            ListenerSessionExit::ConsumerGone => {
+                record_capture_error("snapshot consumer stopped; capture supervisor exiting");
+                set_capture_state(CAPTURE_STATE_STOPPED);
+                return;
+            }
+            ListenerSessionExit::RestartRequested => {
+                LISTENER_RESTART_COUNT.fetch_add(1, Ordering::SeqCst);
+                log::warn!("CLIPBOARD: Listener session ended; recreating after short delay");
+                // Watchdog-driven restarts should be quick; keep a small floor so we
+                // do not tight-loop if shutdown races.
+                std::thread::sleep(INITIAL_LISTENER_BACKOFF);
+                backoff = INITIAL_LISTENER_BACKOFF;
+            }
+            ListenerSessionExit::Failed(error) => {
+                LISTENER_RESTART_COUNT.fetch_add(1, Ordering::SeqCst);
+                record_capture_error(format!("native listener failed: {error}"));
+                std::thread::sleep(backoff);
+                backoff = next_listener_backoff(backoff);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_native_listener(_event_tx: snapshot_channel::Sender<ClipboardListenerEvent>) {
+    set_capture_state(CAPTURE_STATE_STOPPED);
+    record_capture_error("clipboard capture requires Windows");
+}
+
+/// One materialize attempt. `attempt` is 0-based so the last try can do a
+/// slower image decode. The sequence-bound capture path checks the clipboard
+/// sequence around each call instead of sleeping across a sequence change.
+///
+/// Empty Unicode text is a determinate miss, not a retryable lock: if HTML or
+/// RTF has content we store that clip; otherwise the caller marks the sequence
+/// handled (or cleared) without restarting the listener (SBS-924).
+/// Also returns the clipboard sequence seen right after the last read (see
+/// [`materialize_with_sequence_guard`]).
+#[cfg(target_os = "windows")]
+fn materialize_clipboard_content_once(
+    attempt: u32,
+    coherent_rdp_text: bool,
+) -> (MaterializeOnce, u32) {
+    let sequence = || unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+    // A sequence may become empty while we are binding metadata. The outer
+    // sequence guard will rebind it; never open an empty publication in here.
+    if !clipboard_has_supported_format() {
+        return (MaterializeOnce::DeterminateMiss, sequence());
+    }
+    match crate::clipboard_reader::with_reader(move |reader| {
+        materialize_from_reader(reader, attempt, coherent_rdp_text)
+    }) {
+        Ok(read) => read,
+        Err(crate::clipboard_reader::ReadFailure::Unresponsive) => {
+            (MaterializeOnce::Unresponsive, sequence())
+        }
+        Err(crate::clipboard_reader::ReadFailure::Failed(error)) => {
+            log::debug!("CLIPBOARD: Clipboard read attempt failed: {error}");
+            (MaterializeOnce::Transient, sequence())
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn materialize_from_reader(
+    reader: &crate::clipboard_reader::Reader,
+    attempt: u32,
+    coherent_rdp_text: bool,
+) -> MaterializeOnce {
+    let last_attempt = attempt + 1 == 10;
+    if clipboard_has_image_format() && clipboard_has_file_payload_format() {
+        return match read_clipboard_image(reader, last_attempt) {
+            Ok(image) => MaterializeOnce::Captured(captured_image(image), Vec::new()),
+            Err(_) => MaterializeOnce::Transient,
+        };
+    }
+
+    let Some((text, html, rtf)) = read_text_formats(
+        || reader.text().ok(),
+        || {
+            reader
+                .bytes(register_clipboard_format("HTML Format"))
+                .ok()
+                .and_then(|bytes| crate::cf_html::html_document_from_cf_html(&bytes))
+        },
+        || {
+            reader
+                .bytes(register_clipboard_format("Rich Text Format"))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        },
+        coherent_rdp_text,
+    ) else {
+        return MaterializeOnce::Transient;
+    };
+    let text_read = observed_payload(&text, clipboard_has_unicode_text_format());
+    let html_read = observed_payload(&html, clipboard_has_html_format());
+    let rtf_read = observed_payload(&rtf, clipboard_has_rtf_format());
+    let image_advertised = clipboard_has_image_format();
+    // Match the decision policy before starting expensive rendering: unread
+    // advertised text retries first. Empty/missing text still permits pictures.
+    let needs_image =
+        crate::clipboard_miss::needs_image_read(text_read, image_advertised, last_attempt);
+    let image = needs_image
+        .then(|| read_clipboard_image(reader, last_attempt).ok())
+        .flatten();
+    match crate::clipboard_miss::decide_capture(crate::clipboard_miss::AttemptFacts {
+        text: text_read,
+        html: html_read,
+        rtf: rtf_read,
+        image_advertised,
+        image_readable: image.is_some(),
+        last_attempt,
+    }) {
+        crate::clipboard_miss::CaptureDecision::Image => match image {
+            Some(image) => MaterializeOnce::Captured(captured_image(image), Vec::new()),
+            None => MaterializeOnce::Transient,
+        },
+        crate::clipboard_miss::CaptureDecision::Rich(rich) => {
+            match capture_text(rich.searchable_text) {
+                Some(content) => {
+                    MaterializeOnce::Captured(content, captured_rich_formats(rich.html, rich.rtf))
+                }
+                None => MaterializeOnce::DeterminateMiss,
+            }
+        }
+        crate::clipboard_miss::CaptureDecision::DeterminateMiss => MaterializeOnce::DeterminateMiss,
+        crate::clipboard_miss::CaptureDecision::Transient => MaterializeOnce::Transient,
+    }
+}
+
+/// RDP's data object can render a newer payload under the same clipboard
+/// sequence. Surround auxiliary format reads with a second Unicode read so a
+/// username preview cannot be paired with a subsequent password's RTF.
+#[cfg(target_os = "windows")]
+fn read_text_formats(
+    mut read_text: impl FnMut() -> Option<String>,
+    read_html: impl FnOnce() -> Option<String>,
+    read_rtf: impl FnOnce() -> Option<String>,
+    coherent_rdp_text: bool,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let text = read_text();
+    let html = read_html();
+    let rtf = read_rtf();
+    if coherent_rdp_text && read_text() != text {
+        return None;
+    }
+    Some((text, html, rtf))
+}
+
+/// All payload bytes are detached from the OLE medium before image parsing or
+/// PNG encoding. PNG remains byte-for-byte intact; DIB uses the same decoder
+/// family as clipboard-rs and keeps the existing image content/hash policy.
+#[cfg(target_os = "windows")]
+fn read_clipboard_image(
+    reader: &crate::clipboard_reader::Reader,
+    allow_slow_fallback: bool,
+) -> Result<ClipboardImageRead, String> {
+    use std::io::Cursor;
+    let png_format = registered_png_format();
+    if crate::clipboard_reader::available(png_format) {
+        let png_result = reader.bytes(png_format).and_then(|png_bytes| {
+            let (width, height) = image::io::Reader::new(Cursor::new(&png_bytes))
+                .with_guessed_format()
+                .map_err(|e| e.to_string())?
+                .into_dimensions()
+                .map_err(|e| e.to_string())?;
+            Ok(ClipboardImageRead {
+                raw_hash: calculate_hash(&png_bytes),
+                png_bytes,
+                width,
+                height,
+                decode_ms: 0,
+                source_type: "registered-png",
+            })
+        });
+        match png_result {
+            Ok(image) => return Ok(image),
+            Err(error) if !allow_slow_fallback => return Err(error),
+            Err(_) => {}
+        }
+    }
+    // A CF_DIBV5 that cannot be read or decoded must not hide a usable CF_DIB.
+    let mut decoded = Err("clipboard has no bitmap format".to_string());
+    for format in [17, 8] {
+        if crate::clipboard_reader::available(format) {
+            decoded = reader.bytes(format).and_then(decode_clipboard_dib);
+            if decoded.is_ok() {
+                break;
+            }
+        }
+    }
+    let image = decoded?;
+    let raw_hash = calculate_hash(image.as_bytes());
+    let (width, height) = (image.width(), image.height());
+    let mut png = Cursor::new(Vec::new());
+    image
+        .to_rgba8()
+        .write_to(&mut png, image_capture::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(ClipboardImageRead {
+        png_bytes: png.into_inner(),
+        width,
+        height,
+        raw_hash,
+        decode_ms: 0,
+        source_type: "ole-dib",
+    })
+}
+
+/// `image` 0.25.10's headerless decoder skips another 12 mask bytes after V4/V5
+/// BI_BITFIELDS headers, although those masks are already inside the header.
+/// Supply an explicit BMP pixel offset for these packed DIBs. Keep the existing
+/// decoder/encoder for pixel and hash compatibility, without discarding alpha.
+#[cfg(target_os = "windows")]
+pub(crate) fn decode_clipboard_dib(
+    mut bytes: Vec<u8>,
+) -> Result<image_capture::DynamicImage, String> {
+    use std::io::Cursor;
+    let dword = |offset| {
+        bytes
+            .get(offset..offset + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("four bytes")))
+    };
+    let header_size = dword(0).unwrap_or(0);
+    let extended_bitfields = matches!(header_size, 108 | 124) && dword(16) == Some(3);
+    let decoder = if extended_bitfields {
+        // Packed clipboard DIBs place pixels after the header and color table;
+        // a V5 embedded profile follows the pixels, not the other way around.
+        let colors = dword(32).ok_or("truncated DIB header")?;
+        let offset = colors
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(header_size))
+            .filter(|&n| n as usize <= bytes.len())
+            .ok_or("invalid DIB color table")?;
+        let file_size = u32::try_from(bytes.len())
+            .ok()
+            .and_then(|n| n.checked_add(14))
+            .ok_or("DIB is too large for a BMP header")?;
+        let mut header = Vec::with_capacity(14);
+        header.extend_from_slice(b"BM");
+        header.extend_from_slice(&file_size.to_le_bytes());
+        header.extend_from_slice(&[0; 4]);
+        header.extend_from_slice(&(offset + 14).to_le_bytes());
+        drop(bytes.splice(..0, header));
+        image_capture::codecs::bmp::BmpDecoder::new(Cursor::new(bytes))
+    } else {
+        image_capture::codecs::bmp::BmpDecoder::new_without_file_header(Cursor::new(bytes))
+    }
+    .map_err(|e| e.to_string())?;
+    image_capture::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn materialize_clipboard_content_once(attempt: u32) -> MaterializeOnce {
+    const ATTEMPTS: u32 = 10;
+    let last_attempt = attempt + 1 == ATTEMPTS;
+
+    // Screenshot tools commonly expose both a bitmap and CF_HDROP for the
+    // saved image. Treat that as an image in Cubby. If the advertised image
+    // is still being rendered, do not let the easier file read mask it
+    // immediately; retry the image for the complete bounded window.
+    if clipboard_has_image_format() && clipboard_has_file_payload_format() {
+        if let Ok(image) = read_clipboard_image_fast(last_attempt) {
+            return MaterializeOnce::Captured(captured_image(image), Vec::new());
+        }
+        // The caller records this hybrid update as handled on the last miss.
+        // Do not fall through to text, where the path could be captured as a
+        // text clip.
+        return MaterializeOnce::Transient;
+    }
+
+    if let Ok(ctx) = ClipboardContext::new() {
+        let text = ctx.get_text().ok();
+        let html = clipboard_html_document(&ctx);
+        let rtf = ctx.get_rich_text().ok();
+        let text_read = observed_payload(&text, clipboard_has_unicode_text_format());
+        let html_read = observed_payload(&html, clipboard_has_html_format());
+        let rtf_read = observed_payload(&rtf, clipboard_has_rtf_format());
+
+        // Only decode when the Unicode body cannot carry the copy on its own.
+        // A non-empty text clip never needs the bitmap, and decoding one on
+        // every attempt would pay for pixels nobody stores.
+        let image = if matches!(
+            text_read,
+            crate::clipboard_miss::PayloadRead::Present(body) if !body.is_empty()
+        ) {
+            None
+        } else {
+            read_clipboard_image_fast(last_attempt).ok()
+        };
+
+        let decision = crate::clipboard_miss::decide_capture(crate::clipboard_miss::AttemptFacts {
+            text: text_read,
+            html: html_read,
+            rtf: rtf_read,
+            image_advertised: clipboard_has_image_format(),
+            image_readable: image.is_some(),
+            last_attempt,
+        });
+        return match decision {
+            crate::clipboard_miss::CaptureDecision::Image => match image {
+                Some(image) => MaterializeOnce::Captured(captured_image(image), Vec::new()),
+                None => MaterializeOnce::Transient,
+            },
+            crate::clipboard_miss::CaptureDecision::Rich(rich) => {
+                match capture_text(rich.searchable_text) {
+                    Some(content) => MaterializeOnce::Captured(
+                        content,
+                        captured_rich_formats(rich.html, rich.rtf),
+                    ),
+                    // The body strips to nothing after all. Nothing here will
+                    // change on a retry, so do not restart the listener.
+                    None => MaterializeOnce::DeterminateMiss,
+                }
+            }
+            crate::clipboard_miss::CaptureDecision::DeterminateMiss => {
+                MaterializeOnce::DeterminateMiss
+            }
+            crate::clipboard_miss::CaptureDecision::Transient => MaterializeOnce::Transient,
+        };
+    }
+
+    if let Ok(image) = read_clipboard_image_fast(last_attempt) {
+        return MaterializeOnce::Captured(captured_image(image), Vec::new());
+    }
+    MaterializeOnce::Transient
+}
+
+fn observed_payload(
+    value: &Option<String>,
+    advertised: bool,
+) -> crate::clipboard_miss::PayloadRead<'_> {
+    match value {
+        Some(body) => crate::clipboard_miss::PayloadRead::Present(body),
+        None if advertised => crate::clipboard_miss::PayloadRead::Unknown,
+        None => crate::clipboard_miss::PayloadRead::Missing,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_has_unicode_text_format() -> bool {
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe { windows::Win32::System::DataExchange::IsClipboardFormatAvailable(CF_UNICODETEXT) }
+        .is_ok()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_has_unicode_text_format() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_has_html_format() -> bool {
+    let format = register_clipboard_format("HTML Format");
+    format != 0
+        && unsafe { windows::Win32::System::DataExchange::IsClipboardFormatAvailable(format) }
+            .is_ok()
+}
+
+/// HTML document from the clipboard, parsed without clipboard-rs `get_html`.
+///
+/// `get_html` slices StartHTML..EndHTML with `str[]` after only checking that
+/// `end - start <= len`. A header whose EndHTML is past the payload panics, and
+/// release builds abort the process (SBS-999). Raw bytes plus
+/// [`crate::cf_html::html_document_from_cf_html`] drop the format instead.
+#[cfg(not(target_os = "windows"))]
+fn clipboard_html_document(ctx: &ClipboardContext) -> Option<String> {
+    let bytes = ctx.get_buffer("HTML Format").ok()?;
+    crate::cf_html::html_document_from_cf_html(&bytes)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_has_html_format() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn clipboard_has_rtf_format() -> bool {
+    let format = register_clipboard_format("Rich Text Format");
+    format != 0
+        && unsafe { windows::Win32::System::DataExchange::IsClipboardFormatAvailable(format) }
+            .is_ok()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_has_rtf_format() -> bool {
+    false
+}
+
+fn captured_rich_formats(html: Option<String>, rtf: Option<String>) -> Vec<CapturedFormat> {
+    let mut formats = Vec::new();
+    if let Some(html) = html {
+        formats.push(CapturedFormat {
+            name: "html",
+            content: html.into_bytes(),
+        });
+    }
+    if let Some(rtf) = rtf {
+        formats.push(CapturedFormat {
+            name: "rtf",
+            content: rtf.into_bytes(),
+        });
+    }
+    formats
+}
+
+/// Outcome of one materialize attempt. Transient misses retry; a determinate
+/// miss (opened, empty/missing text, no HTML/RTF, no image) must not.
+enum MaterializeOnce {
+    Captured(CapturedContent, Vec<CapturedFormat>),
+    DeterminateMiss,
+    Transient,
+    /// The owner did not render within Windows' 30 s delayed-render limit.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Unresponsive,
+}
+
+/// Stop retrying once we know the copy is captured, is a determinate miss, or
+/// its owner stopped responding.
+enum MaterializeAttempt {
+    Captured(CapturedContent, Vec<CapturedFormat>),
+    DeterminateMiss,
+    Unresponsive,
+}
+
+fn captured_image(image: ClipboardImageRead) -> CapturedContent {
+    CapturedContent::Image {
+        png_bytes: image.png_bytes,
+        width: image.width,
+        height: image.height,
+        hash: image.raw_hash,
+        decode_ms: image.decode_ms,
+        source_type: image.source_type,
+    }
+}
+
+fn clipboard_retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(1_u64 << attempt.min(6))
+}
+
+fn capture_text(text: String) -> Option<CapturedContent> {
+    if text.is_empty() {
+        return None;
+    }
+
+    // Same bound as edit-in-place and Ditto import (SBS-994).
+    let preview = crate::clip_list::truncate_text_preview(&text);
+    let content = text.into_bytes();
+    let hash = calculate_hash(&content);
+    Some(CapturedContent::Text {
+        content,
+        preview,
+        hash,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_clipboard_image_with_clipboard_rs(
+    source_type: &'static str,
+) -> Result<ClipboardImageRead, String> {
+    let ctx = ClipboardContext::new().map_err(|e| e.to_string())?;
+    let image = ctx.get_image().map_err(|e| e.to_string())?;
+    let (width, height) = image.get_size();
+
+    let dynamic_image = image.get_dynamic_image().map_err(|e| e.to_string())?;
+    let raw_hash = calculate_hash(dynamic_image.as_bytes());
+
+    let png_bytes = image
+        .to_png()
+        .map_err(|e| e.to_string())?
+        .get_bytes()
+        .to_vec();
+
+    Ok(ClipboardImageRead {
+        png_bytes,
+        width,
+        height,
+        raw_hash,
+        decode_ms: 0,
+        source_type,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_clipboard_image_fast(_allow_slow_fallback: bool) -> Result<ClipboardImageRead, String> {
+    read_clipboard_image_with_clipboard_rs("clipboard-rs-image")
+}
+
+fn rgba_to_cf_dib(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    const HEADER_SIZE: usize = 40;
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .ok_or_else(|| "clipboard image row is too large".to_string())?;
+    let pixel_bytes = row_bytes
+        .checked_mul(height as usize)
+        .ok_or_else(|| "clipboard image is too large".to_string())?;
+    if rgba.len() != pixel_bytes {
+        return Err("clipboard image pixel buffer has an invalid length".to_string());
+    }
+    let width_i32 = i32::try_from(width).map_err(|_| "clipboard image is too wide".to_string())?;
+    let height_i32 =
+        i32::try_from(height).map_err(|_| "clipboard image is too tall".to_string())?;
+    let image_size =
+        u32::try_from(pixel_bytes).map_err(|_| "clipboard image is too large".to_string())?;
+
+    let mut dib = Vec::with_capacity(HEADER_SIZE + pixel_bytes);
+    dib.extend_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+    dib.extend_from_slice(&width_i32.to_le_bytes());
+    // Positive DIB heights are bottom-up and have the broadest compatibility
+    // with older Win32 paste targets.
+    dib.extend_from_slice(&height_i32.to_le_bytes());
+    dib.extend_from_slice(&1_u16.to_le_bytes());
+    dib.extend_from_slice(&32_u16.to_le_bytes());
+    dib.extend_from_slice(&0_u32.to_le_bytes()); // BI_RGB
+    dib.extend_from_slice(&image_size.to_le_bytes());
+    dib.extend_from_slice(&0_i32.to_le_bytes());
+    dib.extend_from_slice(&0_i32.to_le_bytes());
+    dib.extend_from_slice(&0_u32.to_le_bytes());
+    dib.extend_from_slice(&0_u32.to_le_bytes());
+
+    for source_row in rgba.chunks_exact(row_bytes).rev() {
+        for pixel in source_row.as_chunks::<4>().0 {
+            dib.push(pixel[2]);
+            dib.push(pixel[1]);
+            dib.push(pixel[0]);
+            dib.push(pixel[3]);
+        }
+    }
+    Ok(dib)
+}
+
+/// Put stored PNG bytes on the clipboard without recompressing them.
+/// `clipboard-rs::set_image` encodes PNG a second time before producing a
+/// bitmap, which costs several seconds for multi-megapixel screenshots in dev
+/// builds. The original PNG remains the lossless representation while CF_DIB
+/// is generated with a linear RGBA-to-BGRA conversion for traditional apps.
+pub(crate) fn set_clipboard_image_png(png_bytes: &[u8]) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Decode before opening: a failure here must leave the existing
+        // clipboard untouched rather than emptied.
+        let prepared = prepare_image_clipboard_formats(png_bytes)?;
+        let _clipboard = clipboard_win::Clipboard::new_attempts(10)
+            .map_err(|e| format!("could not open clipboard: {e}"))?;
+        clipboard_win::raw::empty().map_err(|e| format!("could not clear clipboard: {e}"))?;
+        write_image_clipboard_formats(&prepared)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let image = RustImageData::from_bytes(png_bytes).map_err(|e| e.to_string())?;
+        ClipboardContext::new()
+            .and_then(|context| context.set_image(image))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The PNG and CF_DIB renderings of one image, plus the registered PNG format,
+/// all resolved *before* the clipboard is opened.
+///
+/// Everything that can fail belongs in here. Decoding after the clipboard has
+/// been emptied means an undecodable PNG — or a `rgba_to_cf_dib` guard — leaves
+/// the user with an empty clipboard and nothing written, which also trips
+/// `forget_on_clipboard_clear`. Decoding a multi-megapixel screenshot also takes
+/// long enough that holding the global clipboard handle across it stalls every
+/// other application that wants to read or write.
+#[cfg(target_os = "windows")]
+struct PreparedImageFormats<'a> {
+    png_format: u32,
+    png: &'a [u8],
+    dib: Vec<u8>,
+}
+
+#[cfg(target_os = "windows")]
+fn prepare_image_clipboard_formats(png_bytes: &[u8]) -> Result<PreparedImageFormats<'_>, String> {
+    let rgba = image::load_from_memory(png_bytes)
+        .map_err(|e| e.to_string())?
+        .into_rgba8();
+    let dib = rgba_to_cf_dib(rgba.width(), rgba.height(), rgba.as_raw())?;
+    let png_format = registered_png_format();
+    if png_format == 0 {
+        return Err("could not register the PNG clipboard format".to_string());
+    }
+    Ok(PreparedImageFormats {
+        png_format,
+        png: png_bytes,
+        dib,
+    })
+}
+
+/// Write prepared image formats onto an already-open, already-emptied clipboard,
+/// so callers can publish additional formats under the same handle.
+///
+/// Both formats are required: PNG preserves byte-stable image identity for
+/// self-write suppression, while CF_DIB supports traditional Windows paste
+/// targets. If the second write fails, clear the partial clipboard rather than
+/// reporting success with an inconsistent payload.
+#[cfg(target_os = "windows")]
+fn write_image_clipboard_formats(prepared: &PreparedImageFormats<'_>) -> Result<(), String> {
+    clipboard_win::raw::set_without_clear(prepared.png_format, prepared.png)
+        .map_err(|error| format!("could not set PNG: {error}"))?;
+    if let Err(dib_error) = clipboard_win::raw::set_without_clear(CF_DIB_FORMAT, &prepared.dib) {
+        return match clipboard_win::raw::empty() {
+            Ok(()) => Err(format!("could not set CF_DIB: {dib_error}")),
+            Err(cleanup_error) => Err(format!(
+                "could not set CF_DIB ({dib_error}) or clear partial PNG ({cleanup_error})"
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// True when the clipboard owner is a recognized remote-control client rather
+/// than an ordinary local application.
+///
+/// This distinction carries weight beyond paste strategy. A remote client
+/// writes whatever it received from the far end, so the metadata on that write
+/// describes the *viewer's* policy, not what the originating application meant.
+fn is_remote_client_process(exe_name: Option<&str>) -> bool {
+    exe_name.is_some_and(|exe| crate::remote_clients::classify_remote_process(exe).is_some())
+}
+
+/// True when a remote client is the *attributed owner* of this clipboard write.
+///
+/// `is_explicit_owner` is load-bearing, not a nicety. When `GetClipboardOwner`
+/// fails, attribution falls back to the foreground window — so a local password
+/// manager that writes without claiming ownership, while a remote client
+/// happens to be focused, would otherwise be classified as remote. That would
+/// relay its secret into every remote session and bypass `skip_sensitive` on
+/// the way into history. An unattributed write is never treated as remote.
+fn is_remote_client_owner(exe_name: Option<&str>, is_explicit_owner: bool) -> bool {
+    is_explicit_owner && is_remote_client_process(exe_name)
+}
+
+fn is_rdp_client_owner(exe_name: Option<&str>, is_explicit_owner: bool) -> bool {
+    is_explicit_owner
+        && exe_name.is_some_and(|exe| {
+            crate::remote_clients::classify_remote_process(exe)
+                == Some(crate::remote_clients::RemoteClient::Rdp)
+        })
+}
+
+/// Whether a sensitive-tagged capture should be dropped instead of stored.
+///
+/// Explicit exclusions still apply to local apps and forwarded KeePass copies.
+/// The paired Windows history/cloud DWORDs are a blanket transport policy when
+/// the actual owner is a recognized RDP client. RDP supplies the same pair for
+/// untagged text, so it cannot establish a remote source's privacy intent.
+/// Neither exception applies to foreground-only attribution.
+fn should_skip_sensitive_capture(
+    skip_sensitive: bool,
+    markers: SensitiveMarkers,
+    remote_client: bool,
+    rdp_client: bool,
+) -> bool {
+    let rdp_transport = remote_client && rdp_client && markers.cloud_exclusion;
+    skip_sensitive
+        && (markers.content_owner
+            || (markers.history_exclusion && !rdp_transport)
+            || (markers.monitor_exclusion && !remote_client))
+}
+
+/// Outcome of the skip-likely-secrets capture gate.
+///
+/// `Unscannable` is its own state: failing to decode the paste is not the
+/// same as "not a secret", so capture refuses to store it (SBS-922).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LikelySecretDecision {
+    Store,
+    Skip(crate::secrets::SecretKind),
+    Unscannable,
+}
+
+fn likely_secret_decision(
+    skip_likely_secrets: bool,
+    clip_type: &str,
+    clip_content: &[u8],
+) -> LikelySecretDecision {
+    if !skip_likely_secrets || clip_type != "text" {
+        return LikelySecretDecision::Store;
+    }
+    match std::str::from_utf8(clip_content) {
+        Ok(text) => match crate::secrets::classify_secret(text) {
+            Some(kind) => LikelySecretDecision::Skip(kind),
+            None => LikelySecretDecision::Store,
+        },
+        Err(_) => LikelySecretDecision::Unscannable,
+    }
+}
+
+async fn process_clipboard_snapshot(
+    app: AppHandle,
+    db: Arc<Database>,
+    snapshot: ClipboardSnapshot,
+) {
+    let started = std::time::Instant::now();
+    let mut was_existing = false;
+    let _guard = CLIPBOARD_SYNC.lock().await;
+
+    let materialize_ms = snapshot.materialize_ms;
+    let sequence = snapshot.sequence;
+    let markers = snapshot.sensitive;
+    let queued_ignore = snapshot.ignore;
+    let clip_hash = captured_clip_hash(&snapshot.content, &snapshot.formats);
+    let source_app_info = resolve_captured_source_app_info(*snapshot.source_app);
+    let captured_formats = snapshot.formats;
+    let (clip_type, mut clip_content, clip_preview, _primary_hash, full_image_content, metadata) =
+        match snapshot.content {
+            CapturedContent::Text {
+                content,
+                preview,
+                hash,
+            } => {
+                let format_names: Vec<&str> =
+                    captured_formats.iter().map(|format| format.name).collect();
+                (
+                    "text",
+                    content,
+                    preview,
+                    hash,
+                    None,
+                    (!format_names.is_empty())
+                        .then(|| serde_json::json!({ "formats": format_names }).to_string()),
+                )
+            }
+            CapturedContent::Image {
+                png_bytes,
+                width,
+                height,
+                hash,
+                decode_ms,
+                source_type,
+            } => {
+                let size_bytes = png_bytes.len();
+                // Do not decode a thumbnail here. Self-paste, ignored-app,
+                // and consecutive-Skip discard the snapshot below, and the
+                // old path paid a full PNG decode under CLIPBOARD_SYNC for a
+                // preview that was dropped (SBS-1077).
+                log::debug!(
+                    "CLIPBOARD: Materialized image sequence={} {}x{} source_type={} png_bytes={} decode_ms={}",
+                    sequence,
+                    width,
+                    height,
+                    source_type,
+                    size_bytes,
+                    decode_ms
+                );
+                (
+                    "image",
+                    Vec::new(),
+                    "[Image]".to_string(),
+                    hash,
+                    Some(png_bytes),
+                    Some(
+                        serde_json::json!({
+                            "width": width,
+                            "height": height,
+                            "format": "png",
+                            "size_bytes": size_bytes
+                        })
+                        .to_string(),
+                    ),
+                )
+            }
+        };
+    let hash_material = build_clip_hash_material(
+        clip_type,
+        full_image_content.as_deref().unwrap_or(&clip_content),
+        captured_formats
+            .iter()
+            .map(|format| (format.name, format.content.as_slice())),
+    );
+    debug_assert_eq!(
+        clip_hash,
+        calculate_hash(&hash_material),
+        "captured_clip_hash must match process-time clip identity"
+    );
+
+    // Ignore our own clipboard writes. When a clip is pasted or reused from
+    // Cubby, the paste path sets this ignore hash and already performed the
+    // intended move-to-top bump. Re-capturing our own write here would relabel
+    // the clip's source app (to Cubby) and re-bump its timestamp, which is what
+    // made reused clips collapse to "1 second ago" with a "Cubby Clipboard"
+    // source, so skip processing it entirely.
+    //
+    // The work item carries the hash that was live at enqueue. Honour that
+    // even when the 5s wall-clock TTL has elapsed: a backed-up snapshot
+    // queue must not persist the echo and bump created_at/source_app
+    // (SBS-1022). Consume is one-shot per generation so a genuine re-copy
+    // that bound the same generation is still captured. The live-marker
+    // check still covers a write whose snapshot was queued in the same
+    // window the paste path set the hash.
+    if IGNORE_HASH.lock().ignore_and_consume_self_paste(
+        queued_ignore.as_ref(),
+        clip_hash.as_str(),
+        Instant::now(),
+        IGNORE_HASH_TTL,
+    ) {
+        log::info!("CLIPBOARD: Ignoring self-paste (own clipboard write)");
+        return;
+    }
+
+    // Source app info was captured at event time (before debounce) to avoid race conditions
+    let (source_app, source_icon, exe_name, full_path, is_explicit_owner) = source_app_info;
+    log::debug!(
+        "CLIPBOARD: Source attribution available={} executable available={} explicit={}",
+        source_app.is_some(),
+        exe_name.is_some(),
+        is_explicit_owner
+    );
+
+    // Check settings (cached via SettingsManager)
+    use crate::settings_manager::SettingsManager;
+    use tauri::Manager;
+    let manager = app.state::<Arc<SettingsManager>>();
+    let settings = manager.get();
+
+    // Skipped captures must not leave an older clip as the clear-forget target.
+    // Otherwise: copy note → skip password → auto-clear would delete the note.
+    let discard_clear_target = || {
+        *LAST_ACCEPTED_CAPTURE.lock() = None;
+    };
+
+    let remote_client = is_remote_client_owner(exe_name.as_deref(), is_explicit_owner);
+    let rdp_client = is_rdp_client_owner(exe_name.as_deref(), is_explicit_owner);
+
+    // Resolved before the relay because an ignored application is excluded from
+    // transport too, not just from history.
+    let is_ignored = |name: &str| {
+        let name_lower = name.to_lowercase();
+        settings
+            .ignored_apps
+            .iter()
+            .any(|app| app.to_lowercase() == name_lower)
+    };
+    let ignored_match = full_path
+        .as_deref()
+        .filter(|path| is_ignored(path))
+        .map(|_| "path")
+        .or_else(|| {
+            exe_name
+                .as_deref()
+                .filter(|exe| is_ignored(exe))
+                .map(|_| "executable")
+        });
+
+    // Storage and relay both honor skip gates first. Relaying before skip
+    // emptied the clipboard and republished text/html/rtf only, which stripped
+    // do-not-retain markers and Office private formats (SBS-1001). Content the
+    // owning application tagged is never rewritten.
+    if should_skip_sensitive_capture(settings.skip_sensitive, markers, remote_client, rdp_client) {
+        log::info!(
+            "CLIPBOARD: Skipping sensitive content (viewer_ignore={}, history_exclusion={}, cloud_exclusion={}, monitor_exclusion={}, remote_owner={}, rdp_owner={})",
+            markers.content_owner,
+            markers.history_exclusion,
+            markers.cloud_exclusion,
+            markers.monitor_exclusion,
+            remote_client,
+            rdp_client
+        );
+        discard_clear_target();
+        return;
+    }
+
+    match likely_secret_decision(settings.skip_likely_secrets, clip_type, &clip_content) {
+        LikelySecretDecision::Store => {}
+        LikelySecretDecision::Skip(kind) => {
+            // Category only — never log the matched clipboard bytes.
+            log::info!("CLIPBOARD: Skipping likely secret ({})", kind.as_str());
+            discard_clear_target();
+            return;
+        }
+        LikelySecretDecision::Unscannable => {
+            log::info!("CLIPBOARD: Skipping text that could not be scanned for secrets");
+            discard_clear_target();
+            return;
+        }
+    }
+
+    if settings.ignore_ghost_clips && !is_explicit_owner {
+        log::info!("CLIPBOARD: Ignoring ghost clip (unknown owner)");
+        discard_clear_target();
+        return;
+    }
+
+    if let Some(matched_on) = ignored_match {
+        log::info!("CLIPBOARD: Ignoring content from configured application ({matched_on} match)");
+        discard_clear_target();
+        return;
+    }
+
+    // Only accepted content participates in consecutive duplicate suppression.
+    // An ignored application must not prevent the same content from being captured later.
+    //
+    // Hash equality alone is not enough for images: retention can expire the
+    // stored original while LAST_STABLE_HASH still holds this hash, and
+    // skipping here would never revive it (SBS-769). Look up the stored row
+    // when the hashes match. Text keeps today's skip.
+    let storage_hash = db.crypto.keyed_hash(&hash_material);
+    {
+        let consecutive_match = LAST_STABLE_HASH.lock().as_ref() == Some(&clip_hash);
+        if consecutive_match {
+            if clip_type != "image" {
+                return;
+            }
+            let stored = lookup_stored_original(&db.pool, &storage_hash).await;
+            if consecutive_dedup_decision(stored) == ConsecutiveDedupDecision::Skip {
+                return;
+            }
+        }
+    }
+
+    if clip_type == "image" {
+        if let Some(png_bytes) = full_image_content.as_deref() {
+            clip_content = create_image_preview(png_bytes).unwrap_or_default();
+        }
+    }
+
+    // Past this point every early return is a failed capture, and a failure must
+    // not leave the *previous* clip as the clear-forget target: copy password A,
+    // fail to store password B, and the manager's auto-clear would then delete A.
+    // Clearing here rather than at each error return means new failure paths get
+    // this for free. Success re-establishes the marker at the end of the
+    // function, so the only cost is that a failure forgets a clear target that
+    // was about to be replaced anyway.
+    discard_clear_target();
+
+    // DB Logic
+    let pool = &db.pool;
+    let encrypted_content = match db.crypto.encrypt(&clip_content) {
+        Ok(content) => content,
+        Err(error) => {
+            log::error!("CLIPBOARD: Failed to encrypt captured content: {}", error);
+            return;
+        }
+    };
+    let encrypted_preview = match db.crypto.encrypt_text(&clip_preview) {
+        Ok(preview) => preview,
+        Err(error) => {
+            log::error!("CLIPBOARD: Failed to encrypt captured preview: {}", error);
+            return;
+        }
+    };
+    let encrypted_source_app = match db.crypto.encrypt_optional_text(source_app.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("CLIPBOARD: Failed to encrypt source attribution: {}", error);
+            return;
+        }
+    };
+    let encrypted_source_icon = match db.crypto.encrypt_optional_text(source_icon.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("CLIPBOARD: Failed to encrypt source icon: {}", error);
+            return;
+        }
+    };
+    let encrypted_metadata = match db.crypto.encrypt_optional_text(metadata.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("CLIPBOARD: Failed to encrypt content metadata: {}", error);
+            return;
+        }
+    };
+
+    let db_lookup_started = std::time::Instant::now();
+    // A failed lookup must not be read as "no such row". content_hash is unique
+    // as of the idx_clips_hash_unique migration, so the insert below would now
+    // be rejected rather than silently storing a second row -- but a rejected
+    // insert loses the capture just the same, and reports it as a constraint
+    // error rather than as what it is. Since we cannot tell whether the clip
+    // already exists, skip this capture and say so: one recorded miss beats
+    // either a duplicate or a confusing failure further down.
+    let existing_uuid: Option<String> = match sqlx::query_scalar::<_, String>(
+        r#"SELECT uuid FROM clips WHERE content_hash = ?"#,
+    )
+    .bind(&storage_hash)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(found) => found,
+        Err(error) => {
+            // record_capture_error both logs and stores, so the whole reason
+            // belongs in one message: last_error is what
+            // get_clipboard_capture_status surfaces, and "lookup failed" on its
+            // own does not explain why the copy was dropped.
+            record_capture_error(format!(
+                "could not check whether sequence {sequence} was already stored, so it was skipped to avoid a duplicate row: {error}"
+            ));
+            return;
+        }
+    };
+    let db_lookup_ms = db_lookup_started.elapsed().as_millis();
+
+    let db_write_started = std::time::Instant::now();
+    let (emitted_id, inserted_new) = if let Some(existing_id) = existing_uuid {
+        was_existing = true;
+        if clip_type == "image" {
+            if let Some(full_bytes) = &full_image_content {
+                // Stage the new original to a temp file, commit the row change,
+                // and only then move it over the previous `{uuid}.cubby`. A
+                // failure at any step is a capture miss: keep the prior row and
+                // the prior original, and do not enqueue OCR.
+                if recapture_existing_image(
+                    &db,
+                    &existing_id,
+                    full_bytes,
+                    crate::image_persist::RecaptureFields {
+                        source_app: &encrypted_source_app,
+                        source_icon: &encrypted_source_icon,
+                        content: &encrypted_content,
+                        preview: &encrypted_preview,
+                        metadata: encrypted_metadata.clone(),
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            } else if let Err(error) = sqlx::query(
+                r#"
+                UPDATE clips
+                SET created_at = CURRENT_TIMESTAMP,
+                    is_deleted = 0,
+                    source_app = ?,
+                    source_icon = ?,
+                    content = ?,
+                    text_preview = ?,
+                    metadata = ?,
+                    is_thumbnail = 0
+                WHERE uuid = ?
+                "#,
+            )
+            .bind(&encrypted_source_app)
+            .bind(&encrypted_source_icon)
+            .bind(&encrypted_content)
+            .bind(&encrypted_preview)
+            .bind(encrypted_metadata.clone())
+            .bind(&existing_id)
+            .execute(pool)
+            .await
+            {
+                log::error!(
+                    "CLIPBOARD: Failed to update existing image clip {}: {}",
+                    existing_id,
+                    error
+                );
+                return;
+            }
+            // No second pass over the same file. `recapture_existing_image`
+            // above already staged the original, upserted `clip_images`, and
+            // cleared `full_image_expired` in one transaction. Writing
+            // `{uuid}.cubby` again here was not just wasted work: it was the
+            // only place the expired flag was cleared, so a failure of that
+            // second write (no room for another temp copy, or Windows refusing
+            // to replace the file recapture had just created) left the original
+            // on disk and indexed while Paste and Copy went on refusing it as
+            // expired (SBS-769).
+        } else {
+            if let Err(error) = sqlx::query(r#"UPDATE clips SET created_at = CURRENT_TIMESTAMP, is_deleted = 0, source_app = ?, source_icon = ? WHERE uuid = ?"#)
+                .bind(&encrypted_source_app)
+                .bind(&encrypted_source_icon)
+                .bind(&existing_id)
+                .execute(pool)
+                .await
+            {
+                log::error!(
+                    "CLIPBOARD: Failed to update existing text clip {}: {}",
+                    existing_id,
+                    error
+                );
+                return;
+            }
+        }
+        (existing_id, false)
+    } else {
+        let clip_uuid = Uuid::new_v4().to_string();
+
+        if let Err(error) = sqlx::query(
+            r#"
+            INSERT INTO clips (uuid, clip_type, content, text_preview, content_hash, folder_id, is_deleted, is_thumbnail, source_app, source_icon, metadata, ocr_status, created_at, last_accessed)
+            VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .bind(&clip_uuid)
+        .bind(clip_type)
+        .bind(&encrypted_content)
+        .bind(&encrypted_preview)
+        .bind(&storage_hash)
+        .bind(false)
+        .bind(&encrypted_source_app)
+        .bind(&encrypted_source_icon)
+        .bind(encrypted_metadata)
+        .bind((clip_type == "image").then_some("pending"))
+        .execute(pool)
+        .await
+        {
+            log::error!(
+                "CLIPBOARD: Failed to insert {} clip for sequence {}: {}",
+                clip_type,
+                sequence,
+                error
+            );
+            return;
+        }
+
+        if clip_type == "image" {
+            if let Some(full_bytes) = &full_image_content {
+                match persist_full_image_file(
+                    &db.crypto,
+                    &db.image_dir,
+                    &clip_uuid,
+                    full_bytes,
+                ) {
+                    Ok(file_path) => {
+                        if let Err(error) = sqlx::query(
+                            r#"
+                            INSERT OR REPLACE INTO clip_images (clip_uuid, full_content, file_path, file_size, storage_kind, mime_type, created_at)
+                            VALUES (?, x'', ?, ?, 'file', 'image/png', CURRENT_TIMESTAMP)
+                            "#,
+                        )
+                        .bind(&clip_uuid)
+                        .bind(&file_path)
+                        .bind(full_bytes.len() as i64)
+                        .execute(pool)
+                        .await
+                        {
+                            log::error!(
+                                "CLIPBOARD: Failed to index image file for new clip {}: {}",
+                                clip_uuid,
+                                error
+                            );
+                            let _ = sqlx::query(r#"DELETE FROM clips WHERE uuid = ?"#)
+                                .bind(&clip_uuid)
+                                .execute(pool)
+                                .await;
+                            crate::managed_image::remove_clip_image_files(
+                                &db.image_dir,
+                                vec![file_path],
+                            );
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to persist full image file for new clip {}, dropping clip: {}",
+                            clip_uuid,
+                            e
+                        );
+                        let _ = sqlx::query(r#"DELETE FROM clips WHERE uuid = ?"#)
+                            .bind(&clip_uuid)
+                            .execute(pool)
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }
+        (clip_uuid, true)
+    };
+    let db_write_ms = db_write_started.elapsed().as_millis();
+
+    // Durable background OCR is queued only after the image payload is safely
+    // stored. Re-copying an image with missing OCR also gives it a fresh retry.
+    if clip_type == "image" {
+        if let Err(error) = crate::ocr_queue::enqueue(&db, &emitted_id).await {
+            log::warn!("OCR: could not queue stored image: {error}");
+        }
+    }
+
+    if let Err(error) = replace_clip_formats(pool, &db.crypto, &emitted_id, &captured_formats).await
+    {
+        log::error!("CLIPBOARD: Failed to persist auxiliary formats: {}", error);
+        if inserted_new {
+            let image_path: Option<String> = match sqlx::query_scalar(
+                "SELECT file_path FROM clip_images WHERE clip_uuid = ?",
+            )
+            .bind(&emitted_id)
+            .fetch_optional(pool)
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    // A failed lookup is not "no row". Cascading the clip
+                    // delete would drop the path before we could collect it,
+                    // so fall back to the managed `{uuid}.cubby` name.
+                    log::warn!(
+                            "CLIPBOARD: Failed to look up image path while rolling back {emitted_id}: {error}"
+                        );
+                    Some(
+                        db.image_dir
+                            .join(format!("{emitted_id}.cubby"))
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+                }
+            };
+            match sqlx::query("DELETE FROM clips WHERE uuid = ?")
+                .bind(&emitted_id)
+                .execute(pool)
+                .await
+            {
+                Ok(_) => crate::commands::remove_clip_image_files(
+                    &db.image_dir,
+                    image_path.into_iter().collect(),
+                ),
+                Err(cleanup_error) => log::error!(
+                    "CLIPBOARD: Failed to roll back incomplete clip {}: {}",
+                    emitted_id,
+                    cleanup_error
+                ),
+            }
+        }
+        return;
+    }
+
+    *LAST_STABLE_HASH.lock() = Some(clip_hash.clone());
+
+    let retention_deleted = match crate::commands::enforce_retention_in_pool(
+        pool,
+        settings.max_items,
+        settings.auto_delete_days,
+    )
+    .await
+    {
+        Ok((deleted, image_paths)) => {
+            crate::commands::remove_clip_image_files(&db.image_dir, image_paths);
+            if deleted > 0 {
+                log::info!(
+                    "CLIPBOARD: Retention removed {} expired or overflow items",
+                    deleted
+                );
+            }
+            deleted
+        }
+        Err(error) => {
+            log::error!("CLIPBOARD: Retention maintenance failed: {}", error);
+            0
+        }
+    };
+
+    if retention_deleted > 0 {
+        db.search_index.invalidate();
+    } else {
+        db.search_index.upsert(
+            &emitted_id,
+            clip_type,
+            &clip_content,
+            &clip_preview,
+            None,
+            source_app.as_deref(),
+        );
+    }
+
+    // Remember this capture so a short-lived auto-clear can forget it (SOU-316).
+    let credential_like = clip_type == "text"
+        && std::str::from_utf8(&clip_content).is_ok_and(crate::secrets::looks_like_credential);
+    *LAST_ACCEPTED_CAPTURE.lock() = Some(RecentCapture {
+        uuid: emitted_id.clone(),
+        captured_at: Instant::now(),
+        credential_like,
+    });
+
+    let emit_started = Instant::now();
+    let _ = app.emit(
+        "clipboard-change",
+        &serde_json::json!({
+            "id": emitted_id,
+            "content": clip_preview,
+            "clip_type": clip_type,
+            "source_app": source_app,
+            "source_icon": source_icon,
+            "created_at": chrono::Utc::now().to_rfc3339()
+        }),
+    );
+    let emit_ms = emit_started.elapsed().as_millis();
+
+    log::info!(
+        "[perf][clipboard_ingest] sequence={} type={} existing={} full_bytes={} thumb_bytes={} materialize_ms={} db_lookup_ms={} db_write_ms={} emit_ms={} total_ms={}",
+        sequence,
+        clip_type,
+        was_existing,
+        full_image_content.as_ref().map(|v| v.len()).unwrap_or(0),
+        if clip_type == "image" { clip_content.len() } else { 0 },
+        materialize_ms,
+        db_lookup_ms,
+        db_write_ms,
+        emit_ms,
+        started.elapsed().as_millis()
+    );
+}
+
+/// Forget the last capture when the clipboard is cleared shortly afterward.
+///
+/// Password-manager browser extensions copy into chrome.exe/msedge.exe (so the
+/// ignored-apps list cannot help) and almost always empty the clipboard a few
+/// seconds later. Only empty/clear events trigger this — never a new non-empty
+/// copy. Pinned items are never removed.
+async fn process_clipboard_clear(
+    app: AppHandle,
+    db: Arc<Database>,
+    sequence: u32,
+    attempts_left: u8,
+    pinned: Option<RecentCapture>,
+) {
+    use crate::settings_manager::SettingsManager;
+    use tauri::Manager;
+
+    let manager = app.state::<Arc<SettingsManager>>();
+    let settings = manager.get();
+    if !settings.forget_on_clipboard_clear {
+        return;
+    }
+
+    // A retry carries the capture its first attempt was scheduled for, and
+    // deletes exactly that row. Re-reading the marker would delete whatever
+    // copy landed while SQLITE_BUSY held the first attempt, and re-checking the
+    // 90s window would drop a forget that only missed it because the retry
+    // itself took time -- a capture 89.9s old would age out during the delay.
+    let took_marker = pinned.is_none();
+    let recent = {
+        let mut lock = LAST_ACCEPTED_CAPTURE.lock();
+        let within_window = lock.as_ref().is_some_and(|recent| {
+            should_forget_recent_capture(
+                recent.captured_at,
+                Instant::now(),
+                CLIPBOARD_CLEAR_FORGET_WINDOW,
+            )
+        });
+        // A first attempt consumes the marker either way: in the window it is
+        // the target, outside it is stale and must not linger.
+        let marker = if took_marker { lock.take() } else { None };
+        drop(lock);
+        match select_forget_attempt(pinned, marker, within_window) {
+            ForgetAttempt::Pinned(capture) | ForgetAttempt::FromMarker(capture) => Some(capture),
+            ForgetAttempt::Nothing => None,
+        }
+    };
+
+    let Some(recent) = recent else {
+        log::debug!(
+            "CLIPBOARD: Clear sequence {} with no recent capture to forget",
+            sequence
+        );
+        return;
+    };
+
+    if !recent.credential_like {
+        log::info!(
+            "CLIPBOARD: Clear sequence {} — keeping capture {} (not credential-shaped)",
+            sequence,
+            recent.uuid
+        );
+        return;
+    }
+
+    // Every failure below leaves the clip in history, so the attempt has to be
+    // repeatable. The retry carries the capture, so it no longer matters
+    // whether the marker could go back; putting it back is only so a later
+    // clear can still forget the clip if the retries run out (SBS-831).
+    let requeue = |app: AppHandle, db: Arc<Database>, recent: RecentCapture| {
+        if took_marker {
+            let mut lock = LAST_ACCEPTED_CAPTURE.lock();
+            if lock.is_none() {
+                *lock = Some(recent.clone());
+            }
+        }
+        schedule_forget_retry(app, db, sequence, attempts_left, recent);
+    };
+
+    let _guard = CLIPBOARD_SYNC.lock().await;
+    let pool = &db.pool;
+
+    // A failed SELECT must not be read as "already gone". unwrap_or(None)
+    // dropped the retry marker on a transient lock, so a later clear could
+    // not forget the password that was still in history (SBS-831).
+    let uuid = recent.uuid.clone();
+    let lookup = ForgetClipLookup::from_query(
+        sqlx::query_as::<_, (i64, i64)>(
+            r#"
+            SELECT is_pinned, is_deleted
+            FROM clips
+            WHERE uuid = ?
+            "#,
+        )
+        .bind(&uuid)
+        .fetch_optional(pool)
+        .await,
+        recent,
+    );
+
+    let (is_pinned, is_deleted, recent) = match lookup {
+        ForgetClipLookup::Found {
+            row: (is_pinned, is_deleted),
+            taken,
+        } => (is_pinned, is_deleted, taken),
+        ForgetClipLookup::AlreadyGone => {
+            log::debug!(
+                "CLIPBOARD: Clear sequence {} — recent capture {} already gone",
+                sequence,
+                uuid
+            );
+            return;
+        }
+        ForgetClipLookup::Failed { error, taken } => {
+            log::error!(
+                "CLIPBOARD: forget-on-clear lookup failed for sequence {sequence} (clip {}); queueing another attempt at that clip: {error}",
+                taken.uuid
+            );
+            requeue(app, db, taken);
+            return;
+        }
+    };
+
+    if is_pinned != 0 {
+        log::info!(
+            "CLIPBOARD: Clear sequence {} — keeping pinned capture {}",
+            sequence,
+            recent.uuid
+        );
+        // Keep tracking so a later clear after unpin is not required; pinned
+        // items stay forever under this policy.
+        return;
+    }
+    if is_deleted != 0 {
+        return;
+    }
+
+    let mut transaction = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            log::error!("CLIPBOARD: Failed to begin clear-forget transaction: {error}");
+            requeue(app, db, recent);
+            return;
+        }
+    };
+
+    let file_path: Option<String> =
+        match sqlx::query_scalar(r#"SELECT file_path FROM clip_images WHERE clip_uuid = ?"#)
+            .bind(&recent.uuid)
+            .fetch_optional(&mut *transaction)
+            .await
+        {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!(
+                    "CLIPBOARD: Failed to look up image path while forgetting {}: {error}",
+                    recent.uuid
+                );
+                Some(
+                    db.image_dir
+                        .join(format!("{}.cubby", recent.uuid))
+                        .to_string_lossy()
+                        .to_string(),
+                )
+            }
+        };
+
+    // Guarded delete: re-check is_pinned in the same statement so a pin that
+    // lands between the earlier SELECT and this DELETE cannot leave orphan
+    // file/index cleanup for a still-present clip (TOCTOU).
+    let deleted = match sqlx::query(r#"DELETE FROM clips WHERE uuid = ? AND is_pinned = 0"#)
+        .bind(&recent.uuid)
+        .execute(&mut *transaction)
+        .await
+    {
+        Ok(result) => result.rows_affected(),
+        Err(error) => {
+            log::error!(
+                "CLIPBOARD: Failed to forget cleared capture {}: {error}",
+                recent.uuid
+            );
+            requeue(app, db, recent);
+            return;
+        }
+    };
+
+    if deleted == 0 {
+        log::info!(
+            "CLIPBOARD: Clear sequence {} — capture {} not deleted (pinned or already gone)",
+            sequence,
+            recent.uuid
+        );
+        // No restore: either pinned now or already removed. Either way the
+        // clear-forget target should not fire again for this uuid.
+        return;
+    }
+
+    if let Err(error) = transaction.commit().await {
+        log::error!(
+            "CLIPBOARD: Failed to commit clear-forget for {}: {error}",
+            recent.uuid
+        );
+        requeue(app, db, recent);
+        return;
+    }
+
+    // A retry never took the marker, so it can still point at the row that was
+    // just deleted. Clear it only in that case: a newer copy owns the slot now
+    // and must keep its own forget-on-clear window.
+    {
+        let mut lock = LAST_ACCEPTED_CAPTURE.lock();
+        if lock.as_ref().is_some_and(|held| held.uuid == recent.uuid) {
+            lock.take();
+        }
+    }
+
+    crate::commands::remove_clip_image_files(&db.image_dir, file_path.into_iter().collect());
+    db.search_index.remove(&recent.uuid);
+    // The forgotten clip's hash must not suppress a deliberate re-copy later.
+    reset_capture_dedup();
+
+    log::info!(
+        "CLIPBOARD: Forgot capture {} after clipboard clear (sequence {}, within {}s window)",
+        recent.uuid,
+        sequence,
+        CLIPBOARD_CLEAR_FORGET_WINDOW.as_secs()
+    );
+
+    let _ = app.emit(
+        "clipboard-change",
+        &serde_json::json!({
+            "id": recent.uuid,
+            "forgotten_on_clear": true,
+        }),
+    );
+}
+
+/// SBS-1003: a password manager clears once. Restoring the marker without a
+/// follow-up attempt left the password in history whenever SQLITE_BUSY won
+/// that single SELECT/DELETE.
+///
+/// The capture travels with the retry. The first attempt holds CLIPBOARD_SYNC
+/// across its lookup, so snapshots queue behind it and land the moment it
+/// fails; a retry that re-read the marker would delete one of those instead of
+/// the password this clear was about.
+fn schedule_forget_retry(
+    app: AppHandle,
+    db: Arc<Database>,
+    sequence: u32,
+    attempts_left: u8,
+    recent: RecentCapture,
+) {
+    let Some(remaining) = next_forget_attempts(attempts_left) else {
+        log::warn!(
+            "CLIPBOARD: forget-on-clear gave up on {} after {} attempts",
+            recent.uuid,
+            FORGET_ON_CLEAR_ATTEMPTS
+        );
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(FORGET_ON_CLEAR_RETRY_DELAY).await;
+        process_clipboard_clear(app, db, sequence, remaining, Some(recent)).await;
+    });
+}
+
+pub(crate) fn calculate_hash(content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    let result = hasher.finalize();
+    format!("{:x}", result)
+}
+
+/// Build the stable identity used for capture deduplication and self-write
+/// suppression. Auxiliary representations are part of rich text identity, but
+/// an image is identified by its stored bitmap rather than a screenshot tool's
+/// saved file path.
+pub(crate) fn build_clip_hash_material<'a>(
+    clip_type: &str,
+    primary_content: &[u8],
+    formats: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Vec<u8> {
+    let mut material = Vec::new();
+    material.extend_from_slice(clip_type.as_bytes());
+    material.push(0);
+    material.extend_from_slice(primary_content);
+    if clip_type != "image" {
+        for (name, content) in formats {
+            material.push(0);
+            material.extend_from_slice(name.as_bytes());
+            material.push(0);
+            material.extend_from_slice(content);
+        }
+    }
+    material
+}
+
+pub(crate) async fn replace_clip_formats(
+    pool: &sqlx::SqlitePool,
+    crypto: &crate::crypto::CryptoManager,
+    clip_uuid: &str,
+    formats: &[CapturedFormat],
+) -> Result<(), String> {
+    let mut transaction = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM clip_formats WHERE clip_uuid = ?")
+        .bind(clip_uuid)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| e.to_string())?;
+    for format in formats {
+        sqlx::query("INSERT INTO clip_formats (clip_uuid, format, content) VALUES (?, ?, ?)")
+            .bind(clip_uuid)
+            .bind(format.name)
+            .bind(crypto.encrypt(&format.content)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    transaction.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn create_image_preview(png_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let image = image::load_from_memory(png_bytes).map_err(|e| e.to_string())?;
+    let preview = image.thumbnail(320, 220);
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    preview
+        .write_to(&mut bytes, image::ImageOutputFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(bytes.into_inner())
+}
+
+pub use crate::image_persist::persist_full_image_file;
+
+/// Stage a recaptured full-resolution original, update the existing image row
+/// inside one transaction, and commit that transaction only after the staged
+/// file has replaced the live original. A failed rename rolls the row back so
+/// the clip cannot claim an original that is not on disk (SBS-996). Any
+/// earlier failure leaves the prior row and the prior file intact and never
+/// queues OCR against a file that was never written.
+async fn recapture_existing_image(
+    db: &Database,
+    existing_id: &str,
+    full_bytes: &[u8],
+    fields: crate::image_persist::RecaptureFields<'_>,
+) -> Result<(), String> {
+    match crate::image_persist::apply_existing_image_recapture(
+        &db.pool,
+        existing_id,
+        crate::image_persist::stage_full_image_file(
+            &db.crypto,
+            &db.image_dir,
+            existing_id,
+            full_bytes,
+        ),
+        full_bytes.len() as i64,
+        fields,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            record_capture_error(error.clone());
+            Err(error)
+        }
+    }
+}
+
+/// How a consecutive-hash match should be treated once we have looked up the
+/// stored row (SBS-769).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsecutiveDedupDecision {
+    Skip,
+    Capture,
+}
+
+/// Result of looking up the stored clip for a consecutive-hash match.
+///
+/// Three states, not two: a failed lookup is not "no row".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoredOriginalLookup {
+    /// No clip with this hash is stored. Today's skip still applies.
+    Missing,
+    /// Row exists; `true` means retention expired the original.
+    Found { full_image_expired: bool },
+    /// The database could not be read. Treat as unknown: do not skip.
+    Unknown,
+}
+
+/// Decide whether a consecutive-hash match should skip capture.
+///
+/// Today's helper skipped whenever the hashes matched. That drops revival
+/// after retention expires an original: `LAST_STABLE_HASH` still holds the
+/// hash, so the re-copy never reaches the persist path.
+pub(crate) fn consecutive_dedup_decision(stored: StoredOriginalLookup) -> ConsecutiveDedupDecision {
+    match stored {
+        StoredOriginalLookup::Missing => ConsecutiveDedupDecision::Skip,
+        StoredOriginalLookup::Found {
+            full_image_expired: false,
+        } => ConsecutiveDedupDecision::Skip,
+        StoredOriginalLookup::Found {
+            full_image_expired: true,
+        }
+        | StoredOriginalLookup::Unknown => ConsecutiveDedupDecision::Capture,
+    }
+}
+
+pub(crate) async fn lookup_stored_original(
+    pool: &sqlx::SqlitePool,
+    storage_hash: &str,
+) -> StoredOriginalLookup {
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT full_image_expired FROM clips WHERE content_hash = ?",
+    )
+    .bind(storage_hash)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(None) => StoredOriginalLookup::Missing,
+        Ok(Some(full_image_expired)) => StoredOriginalLookup::Found { full_image_expired },
+        Err(error) => {
+            log::warn!(
+                "CLIPBOARD: could not look up stored original for consecutive-dedup: {error}"
+            );
+            StoredOriginalLookup::Unknown
+        }
+    }
+}
+
+/// Why restoring an existing image original failed.
+///
+pub fn read_full_image_file(
+    crypto: &crate::crypto::CryptoManager,
+    file_path: &str,
+) -> Result<Vec<u8>, String> {
+    let encrypted = std::fs::read(file_path).map_err(|e| e.to_string())?;
+    crypto.decrypt(&encrypted)
+}
+
+#[cfg(target_os = "windows")]
+fn get_clipboard_owner_identity() -> Option<SourceAppIdentity> {
+    unsafe {
+        let (hwnd, is_explicit) = match GetClipboardOwner() {
+            Ok(h) if !h.0.is_null() => (h, true),
+            Err(e) => {
+                log::info!(
+                    "CLIPBOARD: GetClipboardOwner failed: {:?}, falling back to foreground window",
+                    e
+                );
+                (GetForegroundWindow(), false)
+            }
+            Ok(_) => {
+                log::info!(
+                    "CLIPBOARD: GetClipboardOwner returned null, falling back to foreground window"
+                );
+                (GetForegroundWindow(), false)
+            }
+        };
+
+        if hwnd.0.is_null() {
+            return None;
+        }
+
+        let mut process_id = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+
+        if process_id == 0 {
+            return None;
+        }
+
+        Some(SourceAppIdentity {
+            process_id,
+            is_explicit_owner: is_explicit,
+        })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_clipboard_owner_identity() -> Option<SourceAppIdentity> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn capture_source_app(identity: Option<SourceAppIdentity>) -> CapturedSourceApp {
+    use windows::core::PWSTR;
+
+    unsafe {
+        let Some(identity) = identity else {
+            return CapturedSourceApp::default();
+        };
+
+        // Reading an executable path does not require access to its memory.
+        // The stronger rights can fail for elevated owners, hiding their remote
+        // classification and incorrectly turning their captures into ghosts.
+        let process_handle = match OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            identity.process_id,
+        ) {
+            Ok(h) => h,
+            Err(_) => {
+                return CapturedSourceApp {
+                    identity: Some(identity),
+                    ..Default::default()
+                }
+            }
+        };
+        // OpenProcess returns a kernel handle. Every other capture path
+        // (paste target, Win+V helper) CloseHandle's it; this one did not, so
+        // each captured clip leaked a process handle until Cubby exited (SBS-1004).
+        struct ProcessHandleGuard(windows::Win32::Foundation::HANDLE);
+        impl Drop for ProcessHandleGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+        let _process_guard = ProcessHandleGuard(process_handle);
+
+        let mut path_buffer = vec![0u16; 32768];
+        let mut path_size = path_buffer.len() as u32;
+        if QueryFullProcessImageNameW(
+            process_handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(path_buffer.as_mut_ptr()),
+            &mut path_size,
+        )
+        .is_err()
+        {
+            // A failed metadata lookup does not undo GetClipboardOwner's
+            // explicit ownership. Privacy still has no remote bypass without
+            // a recognized executable; ordinary copies can still be stored.
+            return CapturedSourceApp {
+                identity: Some(identity),
+                ..Default::default()
+            };
+        }
+        let full_path = String::from_utf16_lossy(&path_buffer[..path_size as usize]);
+        let exe_name = std::path::Path::new(&full_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        CapturedSourceApp {
+            identity: Some(identity),
+            exe_name,
+            full_path: Some(full_path),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn capture_source_app(identity: Option<SourceAppIdentity>) -> CapturedSourceApp {
+    CapturedSourceApp {
+        identity,
+        ..Default::default()
+    }
+}
+
+fn resolve_captured_source_app_info(source: CapturedSourceApp) -> SourceAppInfo {
+    let explicit = source.is_explicit_owner();
+    #[cfg(target_os = "windows")]
+    let (name, icon) = source
+        .full_path
+        .as_deref()
+        .map_or((None, None), |path| unsafe {
+            (get_app_description(path), extract_icon(path))
+        });
+    #[cfg(not(target_os = "windows"))]
+    let (name, icon) = (None, None);
+    (
+        name.or_else(|| source.exe_name.clone()),
+        icon,
+        source.exe_name,
+        source.full_path,
+        explicit,
+    )
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn get_app_description(path: &str) -> Option<String> {
+    use std::ffi::c_void;
+
+    let wide_path: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let size = GetFileVersionInfoSizeW(windows::core::PCWSTR(wide_path.as_ptr()), None);
+    if size == 0 {
+        return None;
+    }
+
+    let mut data = vec![0u8; size as usize];
+    if GetFileVersionInfoW(
+        windows::core::PCWSTR(wide_path.as_ptr()),
+        Some(0),
+        size,
+        data.as_mut_ptr() as *mut _,
+    )
+    .is_err()
+    {
+        return None;
+    }
+
+    let mut lang_ptr: *mut c_void = std::ptr::null_mut();
+    let mut lang_len: u32 = 0;
+
+    let translation_query = OsStr::new("\\VarFileInfo\\Translation")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+
+    if !VerQueryValueW(
+        data.as_ptr() as *const _,
+        windows::core::PCWSTR(translation_query.as_ptr()),
+        &mut lang_ptr,
+        &mut lang_len,
+    )
+    .as_bool()
+    {
+        return None;
+    }
+
+    if lang_len < 4 {
+        return None;
+    }
+
+    let pairs = std::slice::from_raw_parts(lang_ptr as *const u16, (lang_len / 2) as usize);
+    let num_pairs = (lang_len / 4) as usize;
+
+    let mut lang_code = pairs[0];
+    let mut charset_code = pairs[1];
+
+    for i in 0..num_pairs {
+        let code = pairs[i * 2];
+        let charset = pairs[i * 2 + 1];
+
+        if code == 0x0804 {
+            lang_code = code;
+            charset_code = charset;
+        }
+    }
+
+    let keys = ["FileDescription", "ProductName"];
+
+    for key in keys {
+        let query_str = format!(
+            "\\StringFileInfo\\{:04x}{:04x}\\{}",
+            lang_code, charset_code, key
+        );
+        let query = OsStr::new(&query_str)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+
+        let mut desc_ptr: *mut c_void = std::ptr::null_mut();
+        let mut desc_len: u32 = 0;
+
+        if VerQueryValueW(
+            data.as_ptr() as *const _,
+            windows::core::PCWSTR(query.as_ptr()),
+            &mut desc_ptr,
+            &mut desc_len,
+        )
+        .as_bool()
+        {
+            let desc = std::slice::from_raw_parts(desc_ptr as *const u16, desc_len as usize);
+            let len = if desc.last() == Some(&0) {
+                desc.len() - 1
+            } else {
+                desc.len()
+            };
+            if len > 0 {
+                return Some(String::from_utf16_lossy(&desc[..len]));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn extract_icon(path: &str) -> Option<String> {
+    use image::ImageEncoder;
+
+    let wide_path: Vec<u16> = OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut shfi = SHFILEINFOW::default();
+
+    SHGetFileInfoW(
+        windows::core::PCWSTR(wide_path.as_ptr()),
+        windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+        Some(&mut shfi as *mut _),
+        std::mem::size_of::<SHFILEINFOW>() as u32,
+        SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
+    );
+
+    if shfi.hIcon.is_invalid() {
+        return None;
+    }
+
+    let icon = shfi.hIcon;
+    struct IconGuard(windows::Win32::UI::WindowsAndMessaging::HICON);
+    impl Drop for IconGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyIcon(self.0);
+            }
+        }
+    }
+    let _guard = IconGuard(icon);
+
+    let mut icon_info = ICONINFO::default();
+    if GetIconInfo(icon, &mut icon_info).is_err() {
+        return None;
+    }
+
+    struct BitmapGuard(HBITMAP);
+    impl Drop for BitmapGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.0.is_invalid() {
+                    let _ = DeleteObject(self.0.into());
+                }
+            }
+        }
+    }
+    let _bm_mask = BitmapGuard(icon_info.hbmMask);
+    let _bm_color = BitmapGuard(icon_info.hbmColor);
+
+    let mut bm = BITMAP::default();
+    if GetObjectW(
+        icon_info.hbmMask.into(),
+        std::mem::size_of::<BITMAP>() as i32,
+        Some(&mut bm as *mut _ as *mut _),
+    ) == 0
+    {
+        return None;
+    }
+
+    let width = bm.bmWidth;
+    let height = if !icon_info.hbmColor.is_invalid() {
+        bm.bmHeight
+    } else {
+        bm.bmHeight / 2
+    };
+
+    let screen_dc = GetDC(None);
+    let mem_dc = CreateCompatibleDC(Some(screen_dc));
+    let mem_bm = CreateCompatibleBitmap(screen_dc, width, height);
+
+    let old_obj = SelectObject(mem_dc, mem_bm.into());
+
+    let _ = DrawIconEx(mem_dc, 0, 0, icon, width, height, 0, None, DI_NORMAL);
+
+    let bi = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB.0,
+        ..Default::default()
+    };
+
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+
+    GetDIBits(
+        mem_dc,
+        mem_bm,
+        0,
+        height as u32,
+        Some(pixels.as_mut_ptr() as *mut _),
+        &mut BITMAPINFO {
+            bmiHeader: bi,
+            ..Default::default()
+        },
+        DIB_RGB_COLORS,
+    );
+
+    SelectObject(mem_dc, old_obj);
+    let _ = DeleteDC(mem_dc);
+    let _ = DeleteObject(mem_bm.into());
+    let _ = ReleaseDC(None, screen_dc);
+
+    for chunk in pixels.as_chunks_mut::<4>().0 {
+        let b = chunk[0];
+        let r = chunk[2];
+        chunk[0] = r;
+        chunk[2] = b;
+    }
+
+    let mut png_data = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+    encoder
+        .write_image(
+            &pixels,
+            width as u32,
+            height as u32,
+            image::ColorType::Rgba8,
+        )
+        .ok()?;
+
+    Some(BASE64.encode(&png_data))
+}
+
+#[cfg(all(target_os = "windows", feature = "dev-harness"))]
+#[path = "clipboard/capture_probe.rs"]
+mod capture_probe;
+#[cfg(all(target_os = "windows", feature = "dev-harness"))]
+pub use capture_probe::run_capture_probe;
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn successful_same_sequence_samples_reset_separate_contention_episodes() {
+        use super::{
+            deferral_decision, reset_capture_deferrals, CaptureAttempt, MAX_DEFERRALS_PER_SEQUENCE,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let sequence = AtomicU32::new(7);
+        let attempts = AtomicU32::new(0);
+        for _ in 0..100 {
+            let (count, decision) = deferral_decision(
+                sequence.load(Ordering::SeqCst),
+                attempts.load(Ordering::SeqCst),
+                7,
+                MAX_DEFERRALS_PER_SEQUENCE,
+            );
+            attempts.store(count, Ordering::SeqCst);
+            assert_eq!(decision, CaptureAttempt::Deferred);
+            // Both a changed coherent sample and an unchanged deduplicated
+            // sample must reset the retry budget before the next failure.
+            reset_capture_deferrals(&sequence, &attempts, 7);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn temporary_privacy_read_contention_recovers_without_exhausting_rdp_sampling() {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let observed = super::retry_sensitive_markers(
+            || {
+                if elapsed.get() < Duration::from_millis(200) {
+                    Err(crate::clipboard_reader::ReadFailure::Failed(
+                        "transient contention".into(),
+                    ))
+                } else {
+                    Ok(super::SensitiveMarkers {
+                        history_exclusion: true,
+                        cloud_exclusion: true,
+                        ..Default::default()
+                    })
+                }
+            },
+            |delay| elapsed.set(elapsed.get() + delay),
+        )
+        .unwrap_or_else(|_| panic!("transient privacy reads should recover"));
+        assert!(observed.history_exclusion && observed.cloud_exclusion);
+        assert!(elapsed.get() >= Duration::from_millis(200));
+        let mut attempts = 0;
+        let hung = super::retry_sensitive_markers(
+            || {
+                attempts += 1;
+                Err(crate::clipboard_reader::ReadFailure::Unresponsive)
+            },
+            |_| panic!("a hung owner must not be retried"),
+        );
+        assert!(matches!(
+            hung,
+            Err(crate::clipboard_reader::ReadFailure::Unresponsive)
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unreadable_privacy_dwords_are_errors_rather_than_permission_to_retain_or_relay() {
+        for bytes in [vec![], vec![0], vec![0, 0, 0]] {
+            assert!(super::decode_privacy_dword(&bytes).is_err());
+        }
+        assert!(super::decode_privacy_dword(&[0, 0, 0, 0]).unwrap());
+        assert!(!super::decode_privacy_dword(&[1, 0, 0, 0]).unwrap());
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rdp_restart_preserves_sampling_and_does_not_rearm_an_exhausted_owner() {
+        use super::{CaptureAttempt, CapturedSourceApp, RdpPollingState, SourceAppIdentity};
+        let source = CapturedSourceApp {
+            identity: Some(SourceAppIdentity {
+                process_id: 42,
+                is_explicit_owner: true,
+            }),
+            exe_name: Some("mRemoteNG.exe".into()),
+            full_path: None,
+        };
+        let mut polling = RdpPollingState::default();
+        // First startup must not import the current clipboard.
+        polling.observe(false, 7, &source);
+        assert!(polling.owner.is_none());
+        polling.observe(true, 7, &source);
+        // The supervisor passes this same state to a recreated monitor, even
+        // when its catch-up sees no new sequence and no notification.
+        polling.observe(false, 7, &source);
+        assert_eq!(polling.owner, source.identity);
+        for failed in [
+            CaptureAttempt::OwnerUnresponsive,
+            CaptureAttempt::RetryBudgetExhausted,
+        ] {
+            polling.record_attempt(7, failed);
+            for _ in 0..100 {
+                polling.observe(true, 7, &source);
+                assert!(polling.owner.is_none());
+            }
+            polling.observe(true, 8, &source);
+            assert_eq!(polling.owner, source.identity);
+            // Put the next iteration back on sequence 7.
+            polling.observe(true, 7, &source);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rdp_rich_reads_reject_a_newer_password_under_the_username_sequence() {
+        use std::cell::Cell;
+        let changed = Cell::new(false);
+        let mixed = super::read_text_formats(
+            || {
+                Some(
+                    if changed.get() {
+                        "password"
+                    } else {
+                        "username"
+                    }
+                    .into(),
+                )
+            },
+            || None,
+            || {
+                changed.set(true);
+                Some("{\\rtf1 password}".into())
+            },
+            true,
+        );
+        assert!(
+            mixed.is_none(),
+            "mixed preview and normal-paste formats must never be queued"
+        );
+        let coherent = super::read_text_formats(
+            || Some("password".into()),
+            || None,
+            || Some("{\\rtf1 password}".into()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(coherent.0.as_deref(), Some("password"));
+        assert_eq!(coherent.2.as_deref(), Some("{\\rtf1 password}"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn queued_source_identity_survives_the_source_process_exiting() {
+        use super::{capture_source_app, resolve_captured_source_app_info, SourceAppIdentity};
+        use std::os::windows::process::CommandExt;
+        let mut process = std::process::Command::new("cmd.exe")
+            .args(["/d", "/q", "/k"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()
+            .unwrap();
+        let source = capture_source_app(Some(SourceAppIdentity {
+            process_id: process.id(),
+            is_explicit_owner: true,
+        }));
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let (_, _, exe, path, explicit) = resolve_captured_source_app_info(source);
+        assert_eq!(exe.as_deref(), Some("cmd.exe"));
+        assert!(path.is_some());
+        assert!(explicit);
+        let dead_rdp = super::CapturedSourceApp {
+            identity: Some(SourceAppIdentity {
+                process_id: process.id(),
+                is_explicit_owner: true,
+            }),
+            exe_name: Some("mRemoteNG.exe".into()),
+            full_path: Some("C:\\RdpQA\\mRemoteNG.exe".into()),
+        };
+        let (_, _, exe, path, explicit) = resolve_captured_source_app_info(dead_rdp);
+        assert_eq!(path.as_deref(), Some("C:\\RdpQA\\mRemoteNG.exe"));
+        assert!(!super::should_skip_sensitive_capture(
+            true,
+            super::SensitiveMarkers {
+                history_exclusion: true,
+                cloud_exclusion: true,
+                ..Default::default()
+            },
+            super::is_remote_client_owner(exe.as_deref(), explicit),
+            super::is_rdp_client_owner(exe.as_deref(), explicit),
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_shutdown_consumed_by_nonblocking_monitor_still_restarts_before_a_blocking_read() {
+        use super::{run_listener_session, snapshot_channel, ListenerSessionExit};
+        let (ready, abort) = std::sync::mpsc::channel();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut monitor = clipboard_win::Monitor::new().expect("create test monitor");
+            // Simulate leaving RDP sampling after try_recv discarded shutdown.
+            drop(monitor.shutdown_channel());
+            while monitor.try_recv().expect("drain clipboard messages") {}
+            ready.send(monitor.shutdown_channel()).unwrap();
+            let (events, _receiver) = snapshot_channel::channel();
+            let exit = run_listener_session(
+                &mut monitor,
+                &events,
+                &mut None,
+                &mut super::RdpPollingState::default(),
+            );
+            let _ = done.send(exit);
+        });
+        let abort = abort
+            .recv_timeout(Duration::from_secs(5))
+            .expect("monitor ready");
+        let exit = result.recv_timeout(Duration::from_secs(5));
+        // Also unblock the old implementation on a regression, so failure does
+        // not leave a thread waiting forever or require weakening the check.
+        drop(abort);
+        worker.join().expect("monitor thread exited");
+        assert!(matches!(exit, Ok(ListenerSessionExit::RestartRequested)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rdp_samples_retain_changed_text_even_when_sequence_and_owner_never_advance() {
+        use super::{CaptureFingerprint, SensitiveMarkers, SourceAppIdentity};
+        let owner = SourceAppIdentity {
+            process_id: 42,
+            is_explicit_owner: true,
+        };
+        let sensitive = SensitiveMarkers {
+            history_exclusion: true,
+            cloud_exclusion: true,
+            ..Default::default()
+        };
+        let mut last = None;
+        for index in 1..=100 {
+            let sample = CaptureFingerprint {
+                sequence: 7,
+                owner: Some(owner),
+                hash: format!("text-{index}"),
+                sensitive,
+            };
+            assert!(sample.should_queue_rdp_sample(owner, Some(owner), sensitive, last.as_ref()));
+            last = Some(sample);
+            assert!(!last.as_ref().unwrap().should_queue_rdp_sample(
+                owner,
+                Some(owner),
+                sensitive,
+                last.as_ref()
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn rdp_samples_recheck_privacy_and_ownership_without_deduplicating_a_new_exclusion() {
+        use super::{CaptureFingerprint, SensitiveMarkers, SourceAppIdentity};
+        let owner = SourceAppIdentity {
+            process_id: 42,
+            is_explicit_owner: true,
+        };
+        let previous = CaptureFingerprint {
+            sequence: 7,
+            owner: Some(owner),
+            hash: "same text".into(),
+            sensitive: SensitiveMarkers::default(),
+        };
+        let private = CaptureFingerprint {
+            sequence: previous.sequence,
+            owner: previous.owner,
+            hash: previous.hash.clone(),
+            sensitive: SensitiveMarkers {
+                content_owner: true,
+                ..Default::default()
+            },
+        };
+        assert!(private.should_queue_rdp_sample(
+            owner,
+            Some(owner),
+            private.sensitive,
+            Some(&previous)
+        ));
+        assert!(!private.should_queue_rdp_sample(
+            owner,
+            Some(owner),
+            previous.sensitive,
+            Some(&previous)
+        ));
+        let local_owner = SourceAppIdentity {
+            process_id: 43,
+            is_explicit_owner: true,
+        };
+        assert!(!private.should_queue_rdp_sample(
+            owner,
+            Some(local_owner),
+            private.sensitive,
+            None
+        ));
+        assert!(!private.should_queue_rdp_sample(owner, None, private.sensitive, None));
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn packed_v5_with_mask_colored_pixels_and_allocation_padding_is_not_shifted() {
+        let mut dib = vec![0u8; 124];
+        for (offset, value) in [
+            (0, 124u32),
+            (4, 2),
+            (8, (-2i32) as u32),
+            (16, 3),
+            (20, 16),
+            (40, 0x00ff0000),
+            (44, 0x0000ff00),
+            (48, 0x000000ff),
+            (56, 0x73524742),
+        ] {
+            dib[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        dib[12] = 1;
+        dib[14] = 32;
+        dib.extend_from_slice(&[0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]);
+        dib.extend_from_slice(&[0; 12]);
+        let image = super::decode_clipboard_dib(dib).unwrap();
+        assert_eq!(
+            image.to_rgba8().as_raw(),
+            &[255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn packed_v4_and_v5_bitfields_keep_exact_pixels_and_alpha() {
+        for size in [108_u32, 124] {
+            let mut dib = vec![0_u8; size as usize];
+            for (offset, value) in [
+                (0, size),
+                (4, 2),
+                (8, (-2_i32) as u32),
+                (16, 3),
+                (20, 16),
+                (40, 0x00ff0000),
+                (44, 0x0000ff00),
+                (48, 0x000000ff),
+                (52, 0xff000000),
+                (56, 0x73524742),
+            ] {
+                dib[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            dib[12] = 1;
+            dib[14] = 32;
+            dib.extend_from_slice(&[
+                0, 0, 201, 255, 0, 255, 0, 128, 255, 0, 0, 64, 255, 255, 255, 0,
+            ]);
+            let image = super::decode_clipboard_dib(dib.clone()).expect("valid packed DIB");
+            assert_eq!(
+                image.to_rgba8().as_raw(),
+                &[201, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 64, 255, 255, 255, 0]
+            );
+            dib[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(
+                super::decode_clipboard_dib(dib).is_err(),
+                "invalid palette must not overflow"
+            );
+        }
+    }
+
+    use super::{
+        bind_ignore_hash_for_queued_work, build_clip_hash_material, calculate_hash,
+        capture_state_name, capture_text, captured_clip_hash, clear_ignore_hash_if_matches,
+        clipboard_retry_delay, enqueue_listener_event, is_remote_client_owner,
+        is_remote_client_process, likely_secret_decision, next_listener_backoff,
+        release_ignore_for_dropped_events, rgba_to_cf_dib, set_ignore_hash,
+        should_forget_recent_capture, should_skip_sensitive_capture,
+        CapturedContent, CapturedFormat, ClipboardListenerEvent, ClipboardSnapshot,
+        LikelySecretDecision, SensitiveMarkers, SizedPayload, CAPTURE_STATE_LISTENING,
+        CAPTURE_STATE_RESTARTING, CAPTURE_STATE_STOPPED, CLIPBOARD_CLEAR_FORGET_WINDOW,
+        IGNORE_HASH, IGNORE_HASH_TTL,
+    };
+    use super::{ignore_hash, snapshot_channel, snapshot_queue};
+    use std::time::{Duration, Instant};
+
+    fn text_snapshot(
+        sequence: u32,
+        text: &[u8],
+        ignore: Option<ignore_hash::QueuedIgnore>,
+    ) -> ClipboardSnapshot {
+        ClipboardSnapshot {
+            sequence,
+            source_app: Box::default(),
+            content: CapturedContent::Text {
+                content: text.to_vec(),
+                preview: String::from_utf8_lossy(text).into_owned(),
+                hash: "unused".into(),
+            },
+            formats: Vec::new(),
+            materialize_ms: 0,
+            sensitive: SensitiveMarkers::default(),
+            ignore,
+        }
+    }
+
+    fn text_event(
+        sequence: u32,
+        text: &[u8],
+        ignore: Option<ignore_hash::QueuedIgnore>,
+    ) -> ClipboardListenerEvent {
+        ClipboardListenerEvent::Content(text_snapshot(sequence, text, ignore))
+    }
+
+    /// SBS-1032: the queue's RAM budget must count the PNG/HTML/RTF bytes
+    /// that used to sit on the unbounded channel, not just a slot count.
+    #[test]
+    fn snapshot_payload_bytes_count_png_html_and_rtf() {
+        let event = ClipboardListenerEvent::Content(ClipboardSnapshot {
+            sequence: 1,
+            source_app: Box::default(),
+            content: CapturedContent::Image {
+                png_bytes: vec![0; 1000],
+                width: 2,
+                height: 2,
+                hash: "h".repeat(64),
+                decode_ms: 0,
+                source_type: "png",
+            },
+            formats: vec![
+                CapturedFormat {
+                    name: "html",
+                    content: vec![0; 200],
+                },
+                CapturedFormat {
+                    name: "rtf",
+                    content: vec![0; 50],
+                },
+            ],
+            materialize_ms: 0,
+            sensitive: SensitiveMarkers::default(),
+            ignore: None,
+        });
+        assert_eq!(event.payload_bytes(), 1000 + 64 + 200 + 50);
+        assert!(!event.retain_on_flood());
+        assert_eq!(
+            ClipboardListenerEvent::Cleared { sequence: 2 }.payload_bytes(),
+            0
+        );
+        assert!(ClipboardListenerEvent::Cleared { sequence: 2 }.retain_on_flood());
+        assert!(ClipboardListenerEvent::Cleared { sequence: 3 }
+            .replaces_queued(&ClipboardListenerEvent::Cleared { sequence: 2 }));
+        assert!(!event.replaces_queued(&ClipboardListenerEvent::Cleared { sequence: 2 }));
+    }
+
+    /// SBS-1045: a 0-byte `Cleared` used to be the first byte-budget victim.
+    /// The real event type must stay retained so forget-on-clear still runs.
+    #[test]
+    fn a_queued_cleared_survives_a_content_flood() {
+        use super::snapshot_queue::{enqueue, EnqueueOutcome};
+        use std::collections::VecDeque;
+
+        let cleared = ClipboardListenerEvent::Cleared { sequence: 7 };
+        let content = |sequence: u32, bytes: usize| {
+            ClipboardListenerEvent::Content(ClipboardSnapshot {
+                sequence,
+                source_app: Box::default(),
+                content: CapturedContent::Text {
+                    content: vec![b'x'; bytes],
+                    preview: String::new(),
+                    hash: String::new(),
+                },
+                formats: Vec::new(),
+                materialize_ms: 0,
+                sensitive: SensitiveMarkers::default(),
+                ignore: None,
+            })
+        };
+
+        let mut queue = VecDeque::new();
+        let mut queued_bytes = 0usize;
+        assert!(matches!(
+            enqueue(&mut queue, &mut queued_bytes, cleared, 2, 20),
+            EnqueueOutcome::Queued
+        ));
+        assert!(matches!(
+            enqueue(&mut queue, &mut queued_bytes, content(8, 8), 2, 20),
+            EnqueueOutcome::Queued
+        ));
+        let outcome = enqueue(&mut queue, &mut queued_bytes, content(9, 8), 2, 20);
+        assert!(matches!(
+            outcome,
+            EnqueueOutcome::QueuedAfterDrop {
+                dropped: 1,
+                dropped_bytes: 8,
+                evicted,
+            } if evicted.len() == 1
+        ));
+        assert!(matches!(
+            queue.front(),
+            Some(ClipboardListenerEvent::Cleared { sequence: 7 })
+        ));
+        assert!(matches!(
+            queue.back(),
+            Some(ClipboardListenerEvent::Content(snapshot)) if snapshot.sequence == 9
+        ));
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn captured_clip_hash_matches_process_time_identity() {
+        let text = CapturedContent::Text {
+            content: b"hello".to_vec(),
+            preview: "hello".into(),
+            hash: "unused".into(),
+        };
+        let formats = [CapturedFormat {
+            name: "html",
+            content: b"<p>hello</p>".to_vec(),
+        }];
+        assert_eq!(
+            captured_clip_hash(&text, &formats),
+            calculate_hash(&build_clip_hash_material(
+                "text",
+                b"hello",
+                [("html", b"<p>hello</p>".as_slice())],
+            ))
+        );
+
+        let png = vec![0_u8; 16];
+        let image = CapturedContent::Image {
+            png_bytes: png.clone(),
+            width: 2,
+            height: 2,
+            hash: "unused".into(),
+            decode_ms: 0,
+            source_type: "png",
+        };
+        assert_eq!(
+            captured_clip_hash(&image, &formats),
+            calculate_hash(&build_clip_hash_material("image", &png, std::iter::empty()))
+        );
+        let unicode = "Unicode résumé 🔑\n".repeat(50_000).into_bytes();
+        let large = CapturedContent::Text {
+            content: unicode.clone(),
+            preview: "Unicode".into(),
+            hash: "unused".into(),
+        };
+        let rich = [
+            CapturedFormat {
+                name: "html",
+                content: b"<b>Unicode</b>".repeat(50_000),
+            },
+            CapturedFormat {
+                name: "rtf",
+                content: b"{\\rtf1 Unicode}".repeat(50_000),
+            },
+        ];
+        for formats in [&rich[..], &rich[..0]] {
+            assert_eq!(
+                captured_clip_hash(&large, formats),
+                calculate_hash(&build_clip_hash_material(
+                    "text",
+                    &unicode,
+                    formats.iter().map(|f| (f.name, f.content.as_slice()))
+                ))
+            );
+        }
+    }
+
+    /// A kept image still stores a real generated thumbnail (SBS-1077).
+    #[test]
+    fn kept_image_preview_is_a_generated_thumbnail() {
+        use super::create_image_preview;
+
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut png, image::ImageOutputFormat::Png)
+            .expect("tiny PNG");
+        let png = png.into_inner();
+
+        let preview = create_image_preview(&png).expect("preview");
+        assert!(!preview.is_empty());
+        let decoded = image::load_from_memory(&preview).expect("preview decodes");
+        assert!(decoded.width() <= 320 && decoded.height() <= 220);
+    }
+
+    /// Re-introducing `create_image_preview` above the discard gates in
+    /// [`super::process_clipboard_snapshot`] makes these assertions fail.
+    #[test]
+    fn process_clipboard_snapshot_decodes_preview_after_discard_gates() {
+        let src = include_str!("clipboard.rs");
+        let start = src
+            .find("async fn process_clipboard_snapshot")
+            .expect("processor");
+        let end = src[start..]
+            .find("async fn process_clipboard_clear")
+            .expect("clear processor follows snapshot processor")
+            + start;
+        let body = &src[start..end];
+
+        let preview = body
+            .find("create_image_preview")
+            .expect("kept images must still generate a thumbnail");
+        let self_paste = body
+            .find("ignore_and_consume_self_paste")
+            .expect("self-paste gate");
+        let ignored_app = body
+            .find("Ignoring content from configured application")
+            .expect("ignored-app gate");
+        let consecutive = body
+            .find("consecutive_dedup_decision")
+            .expect("consecutive-Skip gate");
+
+        assert!(
+            preview > self_paste,
+            "fail-without-fix: thumbnail decode ran before the self-paste discard"
+        );
+        assert!(
+            preview > ignored_app,
+            "fail-without-fix: thumbnail decode ran before the ignored-app discard"
+        );
+        assert!(
+            preview > consecutive,
+            "fail-without-fix: thumbnail decode ran before the consecutive-Skip discard"
+        );
+        assert!(
+            !body[..self_paste].contains("create_image_preview"),
+            "fail-without-fix: thumbnail decode still ran under CLIPBOARD_SYNC before discard"
+        );
+    }
+
+    /// SBS-1039: flood-drop a bound self-paste echo. Without
+    /// [`release_ignore_for_dropped_events`], IGNORE_HASH stays live and the
+    /// next real copy of the same content is swallowed.
+    #[test]
+    fn dropping_a_bound_echo_releases_ignore_hash_so_the_next_real_copy_is_captured() {
+        *IGNORE_HASH.lock() = ignore_hash::IgnoreState::default();
+        let clip_hash = captured_clip_hash(
+            &CapturedContent::Text {
+                content: b"echo".to_vec(),
+                preview: "echo".into(),
+                hash: "unused".into(),
+            },
+            &[],
+        );
+        set_ignore_hash(clip_hash.clone());
+        let ignore = bind_ignore_hash_for_queued_work(
+            IGNORE_HASH.lock().marker.as_ref(),
+            Instant::now(),
+            IGNORE_HASH_TTL,
+        );
+        assert!(ignore.is_some());
+
+        release_ignore_for_dropped_events(&[text_event(1, b"echo", ignore)]);
+
+        assert!(
+            IGNORE_HASH.lock().marker.is_none(),
+            "fail-without-fix: dropped echo left the live IGNORE_HASH marker"
+        );
+        let recopy = bind_ignore_hash_for_queued_work(
+            IGNORE_HASH.lock().marker.as_ref(),
+            Instant::now(),
+            IGNORE_HASH_TTL,
+        );
+        assert!(
+            !IGNORE_HASH.lock().ignore_and_consume_self_paste(
+                recopy.as_ref(),
+                clip_hash.as_str(),
+                Instant::now(),
+                IGNORE_HASH_TTL,
+            ),
+            "fail-without-fix: dropped echo left IGNORE_HASH swallowing the next real copy"
+        );
+        *IGNORE_HASH.lock() = ignore_hash::IgnoreState::default();
+    }
+
+    #[test]
+    fn dropping_unrelated_or_cleared_events_does_not_release_ignore_hash() {
+        *IGNORE_HASH.lock() = ignore_hash::IgnoreState::default();
+        let echo_hash = captured_clip_hash(
+            &CapturedContent::Text {
+                content: b"echo".to_vec(),
+                preview: "echo".into(),
+                hash: "unused".into(),
+            },
+            &[],
+        );
+        set_ignore_hash(echo_hash.clone());
+        let generation = IGNORE_HASH
+            .lock()
+            .marker
+            .as_ref()
+            .expect("just set")
+            .generation;
+        let passenger = bind_ignore_hash_for_queued_work(
+            IGNORE_HASH.lock().marker.as_ref(),
+            Instant::now(),
+            IGNORE_HASH_TTL,
+        );
+
+        release_ignore_for_dropped_events(&[
+            text_event(1, b"other", passenger),
+            ClipboardListenerEvent::Cleared { sequence: 2 },
+        ]);
+
+        assert_eq!(
+            IGNORE_HASH
+                .lock()
+                .marker
+                .as_ref()
+                .map(|marked| marked.generation),
+            Some(generation),
+            "fail-without-fix: dropping B or a clear spent A's ignore"
+        );
+        assert_eq!(IGNORE_HASH.lock().consumed_generation, None);
+        *IGNORE_HASH.lock() = ignore_hash::IgnoreState::default();
+    }
+
+    /// Whole path: bind at enqueue, flood-evict via the production channel,
+    /// consume on drop, then a later real copy of the same content is not
+    /// ignored (SBS-1039).
+    #[test]
+    fn enqueue_listener_event_releases_ignore_hash_when_a_bound_echo_is_flood_dropped() {
+        *IGNORE_HASH.lock() = ignore_hash::IgnoreState::default();
+        let clip_hash = captured_clip_hash(
+            &CapturedContent::Text {
+                content: b"echo".to_vec(),
+                preview: "echo".into(),
+                hash: "unused".into(),
+            },
+            &[],
+        );
+        set_ignore_hash(clip_hash.clone());
+        let ignore = bind_ignore_hash_for_queued_work(
+            IGNORE_HASH.lock().marker.as_ref(),
+            Instant::now(),
+            IGNORE_HASH_TTL,
+        );
+        let generation = ignore.as_ref().expect("live marker").generation;
+
+        let (tx, rx) = snapshot_channel::channel();
+        enqueue_listener_event(&tx, text_event(1, b"echo", ignore)).expect("receiver is alive");
+        for sequence in 2..=(snapshot_queue::SNAPSHOT_QUEUE_CAPACITY as u32 + 1) {
+            enqueue_listener_event(&tx, text_event(sequence, b"x", None))
+                .expect("receiver is alive");
+        }
+        drop(rx);
+
+        assert!(
+            IGNORE_HASH.lock().marker.is_none(),
+            "fail-without-fix: enqueue_listener_event did not release IGNORE_HASH on flood drop"
+        );
+        assert_eq!(IGNORE_HASH.lock().consumed_generation, Some(generation));
+
+        let recopy = bind_ignore_hash_for_queued_work(
+            IGNORE_HASH.lock().marker.as_ref(),
+            Instant::now(),
+            IGNORE_HASH_TTL,
+        );
+        assert!(
+            !IGNORE_HASH.lock().ignore_and_consume_self_paste(
+                recopy.as_ref(),
+                clip_hash.as_str(),
+                Instant::now(),
+                IGNORE_HASH_TTL,
+            ),
+            "fail-without-fix: dropped echo left IGNORE_HASH swallowing the next real copy"
+        );
+        *IGNORE_HASH.lock() = ignore_hash::IgnoreState::default();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cf_dib_format_matches_the_shared_image_format_table() {
+        let table_dib = crate::clipboard_policy::PREDEFINED_IMAGE_FORMATS
+            .into_iter()
+            .find(|(name, _)| *name == "CF_DIB")
+            .expect("CF_DIB in the shared image format table")
+            .1;
+        assert_eq!(super::CF_DIB_FORMAT, table_dib);
+    }
+
+    #[cfg(target_os = "windows")]
+    mod deferral {
+        use super::super::{deferral_decision, CaptureAttempt, MAX_DEFERRALS_PER_SEQUENCE};
+
+        #[test]
+        fn retries_a_contended_sequence_until_the_budget_runs_out() {
+            // First contention on sequence 42, nothing tracked yet.
+            assert_eq!(
+                deferral_decision(0, 0, 42, 3),
+                (1, CaptureAttempt::Deferred)
+            );
+            assert_eq!(
+                deferral_decision(42, 1, 42, 3),
+                (2, CaptureAttempt::Deferred)
+            );
+            // Third attempt exhausts the budget: write the copy off instead of
+            // leaving the watchdog to restart the listener forever.
+            assert_eq!(
+                deferral_decision(42, 2, 42, 3),
+                (3, CaptureAttempt::Handled)
+            );
+        }
+
+        #[test]
+        fn a_new_sequence_starts_its_own_budget() {
+            // The previous copy burned every attempt; a fresh copy must not
+            // inherit that and be dropped on its first contended read.
+            assert_eq!(
+                deferral_decision(42, 3, 43, 3),
+                (1, CaptureAttempt::Deferred)
+            );
+        }
+
+        #[test]
+        fn saturates_instead_of_overflowing() {
+            assert_eq!(
+                deferral_decision(42, u32::MAX, 42, 3),
+                (u32::MAX, CaptureAttempt::Handled)
+            );
+        }
+
+        #[test]
+        fn the_shipped_budget_allows_more_than_one_try() {
+            // A budget of 1 would give up on the first contended read, which
+            // defeats the deferral mechanism entirely.
+            assert_eq!(
+                deferral_decision(0, 0, 42, MAX_DEFERRALS_PER_SEQUENCE),
+                (1, CaptureAttempt::Deferred)
+            );
+        }
+    }
+
+
+
+    mod sequence_bind {
+        use super::super::{
+            bind_capture_to_sequence, materialize_with_sequence_guard, persist_if_sequence_holds,
+            CapturePrivacyMetadata, SequenceBindError, SequenceBoundCapture,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        const PASSWORD: &str = "hunter2-from-the-next-copy";
+
+        #[test]
+        fn a_sequence_change_after_metadata_does_not_persist_sensitive_content() {
+            let sequence = AtomicU32::new(10);
+            let persisted = std::cell::RefCell::new(None);
+            let bound = bind_capture_to_sequence(
+                || sequence.load(Ordering::SeqCst),
+                || {
+                    let metadata = CapturePrivacyMetadata { sensitive: false };
+                    sequence.store(11, Ordering::SeqCst);
+                    metadata
+                },
+                || PASSWORD,
+            );
+            if let SequenceBoundCapture::Bound { payload, .. } = bound {
+                *persisted.borrow_mut() = Some(payload);
+            }
+            assert!(matches!(
+                bound,
+                SequenceBoundCapture::Changed { from: 10, to: 11 }
+            ));
+            assert!(
+                persisted.borrow().is_none(),
+                "sensitive content from the next sequence must not be persisted"
+            );
+        }
+
+        #[test]
+        fn a_sequence_change_during_delayed_materialize_does_not_persist_sensitive_content() {
+            let sequence = AtomicU32::new(20);
+            let attempts = AtomicU32::new(0);
+            let result = materialize_with_sequence_guard(
+                20,
+                || sequence.load(Ordering::SeqCst),
+                |_| {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        sequence.store(21, Ordering::SeqCst);
+                        None
+                    } else {
+                        Some((PASSWORD, sequence.load(Ordering::SeqCst)))
+                    }
+                },
+                4,
+            );
+            assert!(matches!(
+                result,
+                Err(SequenceBindError::Changed { from: 20, to: 21 })
+            ));
+            assert_ne!(result.ok().flatten(), Some(PASSWORD));
+        }
+
+        #[test]
+        fn a_change_before_the_last_read_rejects_the_payload() {
+            let result = materialize_with_sequence_guard(40, || 40, |_| Some((PASSWORD, 41)), 4);
+            assert_eq!(result, Err(SequenceBindError::Changed { from: 40, to: 41 }));
+        }
+
+        #[test]
+        fn a_copy_after_the_last_read_keeps_the_payload_read_before_it() {
+            // Excel starts the next queued copy as soon as it has rendered the
+            // last format, often before the capture thread gets its result.
+            let sequence = AtomicU32::new(30);
+            let result = materialize_with_sequence_guard(
+                30,
+                || sequence.load(Ordering::SeqCst),
+                |_| {
+                    let after_reads = sequence.load(Ordering::SeqCst);
+                    sequence.store(31, Ordering::SeqCst);
+                    Some(("first copy", after_reads))
+                },
+                4,
+            );
+            assert_eq!(result, Ok(Some("first copy")));
+        }
+
+        #[test]
+        fn persist_is_rejected_when_the_sequence_moves_before_write() {
+            assert_eq!(
+                persist_if_sequence_holds(3, 4, PASSWORD),
+                Err(SequenceBindError::Changed { from: 3, to: 4 })
+            );
+            assert_eq!(persist_if_sequence_holds(3, 3, "safe"), Ok("safe"));
+        }
+
+        #[test]
+        fn a_stable_sequence_keeps_metadata_and_payload_together() {
+            let bound = bind_capture_to_sequence(
+                || 7,
+                || CapturePrivacyMetadata { sensitive: true },
+                || "tagged-secret",
+            );
+            match bound {
+                SequenceBoundCapture::Bound {
+                    sequence,
+                    metadata,
+                    payload,
+                } => {
+                    assert_eq!(sequence, 7);
+                    assert!(metadata.sensitive);
+                    assert_eq!(payload, "tagged-secret");
+                }
+                SequenceBoundCapture::Changed { from, to } => {
+                    panic!("stable sequence changed {from} -> {to}")
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn an_undecodable_image_fails_before_the_clipboard_is_touched() {
+        // Preparation has to reject bad bytes on its own, because
+        // set_clipboard_image_png empties the clipboard only once this returns
+        // Ok. Moving the decode back inside the open handle would leave the
+        // user with an empty clipboard and nothing written, and would keep
+        // every other test in this module green.
+        assert!(super::prepare_image_clipboard_formats(b"\x89PNG\r\n\x1a\nfake").is_err());
+    }
+
+
+
+
+    #[test]
+    fn an_unattributed_owner_is_never_treated_as_remote() {
+        // Attribution falls back to the foreground window when
+        // GetClipboardOwner fails. A password manager writing without claiming
+        // ownership while a remote client is focused must not be relayed into
+        // remote sessions, nor bypass skip_sensitive on the way into history.
+        assert!(!is_remote_client_owner(Some("ncplayer.exe"), false));
+        assert!(!is_remote_client_owner(Some("mstsc.exe"), false));
+        // ...and its blanket tag is still honored, because it is not remote.
+        assert!(should_skip_sensitive_capture(
+            true,
+            MONITOR_EXCLUSION,
+            is_remote_client_owner(Some("ncplayer.exe"), false),
+            false
+        ));
+    }
+
+    /// The viewer's own blanket tag.
+    const MONITOR_EXCLUSION: SensitiveMarkers = SensitiveMarkers {
+        monitor_exclusion: true,
+        content_owner: false,
+        history_exclusion: false,
+        cloud_exclusion: false,
+    };
+    /// What KeePass and friends set about content they own.
+    const OWNER_MARKED: SensitiveMarkers = SensitiveMarkers {
+        monitor_exclusion: false,
+        content_owner: true,
+        history_exclusion: false,
+        cloud_exclusion: false,
+    };
+
+
+    #[test]
+    fn a_remote_viewers_blanket_tag_never_suppresses_storage() {
+        // The viewer tags everything it forwards, so honoring it dropped every
+        // remote-session copy and left a hole in history (SBS-781). Remote
+        // clips going missing is the bug, not the fix.
+        assert!(!should_skip_sensitive_capture(
+            true,
+            MONITOR_EXCLUSION,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn mremoteng_history_and_relay_keep_the_existing_privacy_boundaries() {
+        for name in ["mRemoteNG.exe", "mremoteng.exe", "MREMOTENG.EXE"] {
+            let remote = is_remote_client_owner(Some(name), true);
+            assert!(remote);
+            assert!(!should_skip_sensitive_capture(
+                true,
+                MONITOR_EXCLUSION,
+                remote,
+                false
+            ));
+            assert!(should_skip_sensitive_capture(
+                true,
+                OWNER_MARKED,
+                remote,
+                false
+            ));
+            assert!(should_skip_sensitive_capture(
+                true,
+                SensitiveMarkers {
+                    monitor_exclusion: true,
+                    content_owner: true,
+                    ..SensitiveMarkers::default()
+                },
+                remote,
+                false
+            ));
+
+            // A foreground mRemoteNG window is never evidence that an
+            // unattributed local password copy came from the remote session.
+            let foreground_only = is_remote_client_owner(Some(name), false);
+            assert!(!foreground_only);
+            assert!(should_skip_sensitive_capture(
+                true,
+                MONITOR_EXCLUSION,
+                foreground_only,
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn ordinary_rdp_copies_with_paired_history_and_cloud_opt_outs_are_retained() {
+        // Observed on an actual mRemoteNG RDP connection: neither DWORD was
+        // present at the source, but the client supplied both as zero.
+        let transport = SensitiveMarkers {
+            history_exclusion: true,
+            cloud_exclusion: true,
+            ..SensitiveMarkers::default()
+        };
+        for name in ["mRemoteNG.exe", "MSTSC.EXE", "msrdc.exe"] {
+            for explicit in [true, false] {
+                let remote = is_remote_client_owner(Some(name), explicit);
+                let rdp = super::is_rdp_client_owner(Some(name), explicit);
+                assert_eq!(
+                    should_skip_sensitive_capture(true, transport, remote, rdp),
+                    !explicit,
+                    "{name}, explicit={explicit}"
+                );
+                assert!(should_skip_sensitive_capture(
+                    true,
+                    SensitiveMarkers {
+                        content_owner: true,
+                        ..transport
+                    },
+                    remote,
+                    rdp
+                ));
+                // An isolated history denial is not the observed RDP pair.
+                assert!(should_skip_sensitive_capture(
+                    true,
+                    SensitiveMarkers {
+                        cloud_exclusion: false,
+                        ..transport
+                    },
+                    remote,
+                    rdp
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn paired_history_and_cloud_opt_outs_are_still_honored_outside_rdp() {
+        let markers = SensitiveMarkers {
+            history_exclusion: true,
+            cloud_exclusion: true,
+            ..SensitiveMarkers::default()
+        };
+        for name in [
+            "notepad.exe",
+            "1Password.exe",
+            "ncplayer.exe",
+            "anydesk.exe",
+        ] {
+            assert!(should_skip_sensitive_capture(
+                true,
+                markers,
+                is_remote_client_owner(Some(name), true),
+                super::is_rdp_client_owner(Some(name), true)
+            ));
+        }
+        assert!(!should_skip_sensitive_capture(false, markers, false, false));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn source_attribution_reads_executable_with_limited_process_rights() {
+        let expected = std::env::current_exe().unwrap();
+        let identity = super::SourceAppIdentity {
+            process_id: unsafe { windows::Win32::System::Threading::GetCurrentProcessId() },
+            is_explicit_owner: true,
+        };
+        let (_, _, exe, path, explicit) =
+            super::resolve_captured_source_app_info(super::capture_source_app(Some(identity)));
+        assert!(explicit);
+        assert_eq!(
+            exe.as_deref(),
+            expected.file_name().and_then(|name| name.to_str())
+        );
+        assert_eq!(path.map(std::path::PathBuf::from).as_ref(), Some(&expected));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn failed_source_lookup_preserves_actual_clipboard_ownership() {
+        for explicit in [true, false] {
+            let identity = super::SourceAppIdentity {
+                process_id: 0,
+                is_explicit_owner: explicit,
+            };
+            let (_, _, exe, path, observed_explicit) =
+                super::resolve_captured_source_app_info(super::capture_source_app(Some(identity)));
+            assert!(exe.is_none());
+            assert!(path.is_none());
+            assert_eq!(observed_explicit, explicit);
+            assert!(!is_remote_client_owner(exe.as_deref(), observed_explicit));
+        }
+    }
+
+    #[test]
+    fn an_owner_marker_suppresses_storage_even_over_a_remote_session() {
+        // KeePass through mstsc forwards its own Clipboard Viewer Ignore tag.
+        // That one describes the content, so a remote owner is no reason to
+        // store a password Settings said would not be saved (SBS-1000).
+        assert!(should_skip_sensitive_capture(
+            true,
+            OWNER_MARKED,
+            true,
+            false
+        ));
+        assert!(should_skip_sensitive_capture(
+            true,
+            OWNER_MARKED,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_local_apps_sensitive_marker_still_suppresses_storage() {
+        // The whole point of scoping the bypass: a password manager sets this
+        // deliberately, about content it owns, and must keep being honored.
+        assert!(should_skip_sensitive_capture(
+            true,
+            MONITOR_EXCLUSION,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn untagged_content_and_the_disabled_setting_never_skip() {
+        assert!(!should_skip_sensitive_capture(
+            true,
+            SensitiveMarkers::default(),
+            false,
+            false
+        ));
+        assert!(!should_skip_sensitive_capture(
+            false,
+            OWNER_MARKED,
+            false,
+            false
+        ));
+        assert!(!should_skip_sensitive_capture(
+            false,
+            MONITOR_EXCLUSION,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn sensitive_capture_reports_every_marker() {
+        assert!(MONITOR_EXCLUSION.any());
+        assert!(OWNER_MARKED.any());
+        assert!(!SensitiveMarkers::default().any());
+    }
+
+    /// SBS-922: Skip likely secrets must refuse a 9 KiB paste that starts
+    /// with a known marker, not store it because the whole blob is over 8 KiB.
+    #[test]
+    fn skip_likely_secrets_refuses_a_9kib_prefix_secret() {
+        let padding = "x".repeat(9 * 1024);
+        let github = format!("ghp_{} {padding}", "abcdefghijklmnopqrstuvwxyz0123456789");
+        let aws = format!("AKIA{}{} {padding}", "IOSFODNN7", "EXAMPLE");
+        let pem = format!(
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n{padding}"
+        );
+        assert!(matches!(
+            likely_secret_decision(true, "text", github.as_bytes()),
+            LikelySecretDecision::Skip(crate::secrets::SecretKind::GitHubToken)
+        ));
+        assert!(matches!(
+            likely_secret_decision(true, "text", aws.as_bytes()),
+            LikelySecretDecision::Skip(crate::secrets::SecretKind::AwsAccessKey)
+        ));
+        assert!(matches!(
+            likely_secret_decision(true, "text", pem.as_bytes()),
+            LikelySecretDecision::Skip(crate::secrets::SecretKind::PrivateKey)
+        ));
+        assert_eq!(
+            likely_secret_decision(true, "text", padding.as_bytes()),
+            LikelySecretDecision::Store
+        );
+        // Setting off, or a non-text clip, still stores.
+        assert_eq!(
+            likely_secret_decision(false, "text", github.as_bytes()),
+            LikelySecretDecision::Store
+        );
+        assert_eq!(
+            likely_secret_decision(true, "image", github.as_bytes()),
+            LikelySecretDecision::Store
+        );
+    }
+
+    /// A scan error is not "not a secret". Invalid UTF-8 text cannot be
+    /// classified, so capture skips storage when the setting is on.
+    #[test]
+    fn skip_likely_secrets_treats_undecodable_text_as_unscannable() {
+        assert_eq!(
+            likely_secret_decision(true, "text", &[0xff, 0xfe, 0xfd]),
+            LikelySecretDecision::Unscannable
+        );
+        assert_eq!(
+            likely_secret_decision(false, "text", &[0xff, 0xfe, 0xfd]),
+            LikelySecretDecision::Store
+        );
+    }
+
+    #[test]
+    fn only_remote_clients_bypass_the_sensitive_marker() {
+        // The bypass must never reach a local application: a password manager
+        // sets this marker deliberately and about content it actually owns.
+        assert!(is_remote_client_process(Some("ncplayer.exe")));
+        assert!(is_remote_client_process(Some("mstsc.exe")));
+        assert!(!is_remote_client_process(Some("1Password.exe")));
+        assert!(!is_remote_client_process(Some("notepad.exe")));
+        assert!(!is_remote_client_process(None));
+    }
+
+    #[test]
+    fn forget_window_accepts_clears_within_bound() {
+        let captured = Instant::now();
+        let cleared = captured + Duration::from_secs(30);
+        assert!(should_forget_recent_capture(
+            captured,
+            cleared,
+            CLIPBOARD_CLEAR_FORGET_WINDOW
+        ));
+        assert!(should_forget_recent_capture(
+            captured,
+            captured + CLIPBOARD_CLEAR_FORGET_WINDOW,
+            CLIPBOARD_CLEAR_FORGET_WINDOW
+        ));
+    }
+
+    #[test]
+    fn forget_window_rejects_late_clears() {
+        let captured = Instant::now();
+        let cleared = captured + CLIPBOARD_CLEAR_FORGET_WINDOW + Duration::from_millis(1);
+        assert!(!should_forget_recent_capture(
+            captured,
+            cleared,
+            CLIPBOARD_CLEAR_FORGET_WINDOW
+        ));
+    }
+
+    #[test]
+    fn forget_window_rejects_inverted_timestamps() {
+        let captured = Instant::now();
+        let cleared = captured - Duration::from_secs(1);
+        assert!(!should_forget_recent_capture(
+            captured,
+            cleared,
+            CLIPBOARD_CLEAR_FORGET_WINDOW
+        ));
+    }
+
+    #[test]
+    fn capture_text_preserves_exact_whitespace() {
+        let original = "  copied text\r\nwith trailing space  ".to_string();
+        let captured = capture_text(original.clone()).expect("text should be captured");
+
+        match captured {
+            CapturedContent::Text {
+                content,
+                preview,
+                hash,
+            } => {
+                assert_eq!(content, original.as_bytes());
+                assert_eq!(preview, original);
+                assert_eq!(hash, calculate_hash(original.as_bytes()));
+            }
+            CapturedContent::Image { .. } => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn capture_text_ignores_only_truly_empty_content() {
+        assert!(capture_text(String::new()).is_none());
+        assert!(capture_text("   ".to_string()).is_some());
+    }
+
+    #[test]
+    fn capture_text_preview_uses_the_shared_limit() {
+        let secret = "UNIQUE-SBS-994-CAPTURE-TAIL-SHOULD-NOT-STORE";
+        let body = format!(
+            "{}{secret}",
+            "x".repeat(crate::clip_list::TEXT_PREVIEW_CHAR_LIMIT)
+        );
+        let captured = capture_text(body.clone()).expect("text should be captured");
+        match captured {
+            CapturedContent::Text {
+                content, preview, ..
+            } => {
+                assert_eq!(content, body.as_bytes());
+                assert_eq!(
+                    preview.chars().count(),
+                    crate::clip_list::TEXT_PREVIEW_CHAR_LIMIT
+                );
+                assert!(!preview.contains(secret));
+            }
+            CapturedContent::Image { .. } => panic!("expected text"),
+        }
+    }
+
+    #[test]
+    fn clipboard_contention_backoff_is_bounded() {
+        let delays = (0..10)
+            .map(|attempt| clipboard_retry_delay(attempt).as_millis())
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 64, 64, 64, 64]);
+        assert_eq!(delays.iter().sum::<u128>(), 319);
+        assert_eq!(delays[..9].iter().sum::<u128>(), 255);
+    }
+
+    #[test]
+    fn image_identity_ignores_auxiliary_file_path() {
+        let first = build_clip_hash_material(
+            "image",
+            b"same pixels",
+            [("files", b"[\"C:/shots/first.png\"]".as_slice())],
+        );
+        let second = build_clip_hash_material(
+            "image",
+            b"same pixels",
+            [("files", b"[\"D:/archive/second.png\"]".as_slice())],
+        );
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn non_image_identity_preserves_auxiliary_formats() {
+        let html = build_clip_hash_material(
+            "text",
+            b"same text",
+            [("html", b"<b>same text</b>".as_slice())],
+        );
+        let plain = build_clip_hash_material("text", b"same text", []);
+
+        assert_ne!(html, plain);
+    }
+
+    #[test]
+    fn cf_dib_conversion_writes_bottom_up_bgra_pixels() {
+        let rgba = [
+            1, 2, 3, 4, 5, 6, 7, 8, // top row
+            9, 10, 11, 12, 13, 14, 15, 16, // bottom row
+        ];
+        let dib = rgba_to_cf_dib(2, 2, &rgba).unwrap();
+
+        assert_eq!(&dib[0..4], &40_u32.to_le_bytes());
+        assert_eq!(&dib[4..8], &2_i32.to_le_bytes());
+        assert_eq!(&dib[8..12], &2_i32.to_le_bytes());
+        assert_eq!(
+            &dib[40..],
+            &[11, 10, 9, 12, 15, 14, 13, 16, 3, 2, 1, 4, 7, 6, 5, 8]
+        );
+    }
+
+    #[test]
+    fn failed_write_cleanup_only_clears_its_own_ignore_hash() {
+        set_ignore_hash("expected".to_string());
+        clear_ignore_hash_if_matches("different");
+        assert_eq!(
+            IGNORE_HASH
+                .lock()
+                .marker
+                .as_ref()
+                .map(|marked| marked.hash.as_str()),
+            Some("expected")
+        );
+
+        clear_ignore_hash_if_matches("expected");
+        assert!(IGNORE_HASH.lock().marker.is_none());
+    }
+
+    #[test]
+    fn listener_restart_backoff_doubles_and_caps() {
+        assert_eq!(
+            next_listener_backoff(Duration::from_millis(500)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_listener_backoff(Duration::from_secs(16)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            next_listener_backoff(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn capture_state_names_are_stable_for_diagnostics() {
+        assert_eq!(capture_state_name(CAPTURE_STATE_LISTENING), "listening");
+        assert_eq!(capture_state_name(CAPTURE_STATE_RESTARTING), "restarting");
+        assert_eq!(capture_state_name(CAPTURE_STATE_STOPPED), "stopped");
+    }
+
+    /// SBS-769: consecutive-hash equality used to skip capture unconditionally.
+    /// After retention expires an original, that skip is the revival miss.
+    #[test]
+    fn consecutive_dedup_does_not_skip_an_expired_or_unknown_original() {
+        use super::{consecutive_dedup_decision, ConsecutiveDedupDecision, StoredOriginalLookup};
+
+        // Today's helper: hash match => skip. Expired must not take that path.
+        assert_eq!(
+            consecutive_dedup_decision(StoredOriginalLookup::Found {
+                full_image_expired: true,
+            }),
+            ConsecutiveDedupDecision::Capture
+        );
+        assert_eq!(
+            consecutive_dedup_decision(StoredOriginalLookup::Unknown),
+            ConsecutiveDedupDecision::Capture
+        );
+        assert_eq!(
+            consecutive_dedup_decision(StoredOriginalLookup::Found {
+                full_image_expired: false,
+            }),
+            ConsecutiveDedupDecision::Skip
+        );
+        assert_eq!(
+            consecutive_dedup_decision(StoredOriginalLookup::Missing),
+            ConsecutiveDedupDecision::Skip
+        );
+    }
+
+    mod revive_expired_original {
+        use super::super::{
+            consecutive_dedup_decision, lookup_stored_original, persist_full_image_file,
+            recapture_existing_image, ConsecutiveDedupDecision, StoredOriginalLookup,
+        };
+        use crate::commands::{load_full_image_content, IMAGE_EXPIRED_ERROR};
+        use crate::database::Database;
+        use crate::image_persist::RecaptureFields;
+        use crate::models::Clip;
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::sync::Arc;
+
+        const OCR_TEXT: &str = "invoice AK1A9";
+        const OCR_WORDS: &str = r#"{"image_width":10,"image_height":10,"words":[]}"#;
+        const THUMBNAIL: &[u8] = b"thumbnail-bytes";
+        const ORIGINAL: &[u8] = b"full-resolution-png-bytes";
+
+        async fn test_database() -> Database {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("in-memory database should open");
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&pool)
+                .await
+                .expect("foreign keys should be enabled in tests");
+            let database = Database {
+                pool,
+                crypto: Arc::new(crate::crypto::CryptoManager::ephemeral()),
+                image_dir: std::env::temp_dir()
+                    .join(format!("cubby-sbs-769-{}", uuid::Uuid::new_v4())),
+                search_index: Arc::new(crate::search_index::SearchIndex::default()),
+            };
+            database.migrate().await.expect("migration should succeed");
+            database
+        }
+
+        async fn seed_expired_image(database: &Database, uuid: &str, content_hash: &str) {
+            sqlx::query(
+                r#"
+                INSERT INTO clips (
+                    uuid, clip_type, content, text_preview, content_hash,
+                    ocr_text, ocr_words, ocr_status, full_image_expired, is_thumbnail
+                )
+                VALUES (?, 'image', ?, '[Image]', ?, ?, ?, 'completed', 1, 1)
+                "#,
+            )
+            .bind(uuid)
+            .bind(THUMBNAIL)
+            .bind(content_hash)
+            .bind(OCR_TEXT)
+            .bind(OCR_WORDS)
+            .execute(&database.pool)
+            .await
+            .expect("expired image fixture should insert");
+        }
+
+        async fn expired_flag(database: &Database, uuid: &str) -> i64 {
+            sqlx::query_scalar("SELECT full_image_expired FROM clips WHERE uuid = ?")
+                .bind(uuid)
+                .fetch_one(&database.pool)
+                .await
+                .expect("expired flag should load")
+        }
+
+        async fn ocr_row(database: &Database, uuid: &str) -> (String, String, String) {
+            sqlx::query_as("SELECT ocr_text, ocr_words, ocr_status FROM clips WHERE uuid = ?")
+                .bind(uuid)
+                .fetch_one(&database.pool)
+                .await
+                .expect("ocr columns should load")
+        }
+
+        async fn load_clip(database: &Database, uuid: &str) -> Clip {
+            sqlx::query_as("SELECT * FROM clips WHERE uuid = ?")
+                .bind(uuid)
+                .fetch_one(&database.pool)
+                .await
+                .expect("clip should load")
+        }
+
+        fn cleanup(database: &Database) {
+            let _ = std::fs::remove_dir_all(&database.image_dir);
+        }
+
+        /// The recapture the capture loop performs for an existing image clip:
+        /// stage the original, rewrite the row, index it, then swap the file in.
+        async fn recapture(database: &Database, uuid: &str, bytes: &[u8]) -> Result<(), String> {
+            recapture_existing_image(
+                database,
+                uuid,
+                bytes,
+                RecaptureFields {
+                    source_app: &None,
+                    source_icon: &None,
+                    content: THUMBNAIL,
+                    preview: "[Image]",
+                    metadata: None,
+                },
+            )
+            .await
+        }
+
+        /// SBS-769: re-copying an expired image wrote fresh bytes but left
+        /// `full_image_expired` set, so paste/copy still rejected the original.
+        #[tokio::test]
+        async fn direct_recopy_after_expiry_restores_original_and_keeps_ocr() {
+            let database = test_database().await;
+            seed_expired_image(&database, "shot", "hash-shot").await;
+
+            let mut expired = load_clip(&database, "shot").await;
+            assert_eq!(
+                load_full_image_content(&database, &mut expired)
+                    .await
+                    .unwrap_err(),
+                IMAGE_EXPIRED_ERROR
+            );
+
+            recapture(&database, "shot", ORIGINAL)
+                .await
+                .expect("revival should persist the original");
+
+            assert_eq!(expired_flag(&database, "shot").await, 0);
+            let mut revived = load_clip(&database, "shot").await;
+            let bytes = load_full_image_content(&database, &mut revived)
+                .await
+                .expect("revived original should be loadable");
+            assert_eq!(bytes, ORIGINAL);
+
+            let (ocr_text, ocr_words, ocr_status) = ocr_row(&database, "shot").await;
+            assert_eq!(ocr_text, OCR_TEXT);
+            assert_eq!(ocr_words, OCR_WORDS);
+            assert_eq!(ocr_status, "completed");
+            let thumbnail: Vec<u8> =
+                sqlx::query_scalar("SELECT content FROM clips WHERE uuid = 'shot'")
+                    .fetch_one(&database.pool)
+                    .await
+                    .expect("thumbnail should remain");
+            assert_eq!(thumbnail, THUMBNAIL);
+
+            cleanup(&database);
+        }
+
+        /// SBS-769: LAST_STABLE_HASH matching used to drop the recapture
+        /// entirely after expiry, so a second consecutive copy never revived.
+        #[tokio::test]
+        async fn consecutive_duplicate_after_expiry_does_not_skip_revival() {
+            let database = test_database().await;
+            seed_expired_image(&database, "shot", "hash-shot").await;
+
+            assert_eq!(
+                lookup_stored_original(&database.pool, "hash-shot").await,
+                StoredOriginalLookup::Found {
+                    full_image_expired: true,
+                }
+            );
+            assert_eq!(
+                lookup_stored_original(&database.pool, "no-such-hash").await,
+                StoredOriginalLookup::Missing
+            );
+            // Today's hash-only helper would Skip here and never restore.
+            assert_eq!(
+                consecutive_dedup_decision(StoredOriginalLookup::Found {
+                    full_image_expired: true,
+                }),
+                ConsecutiveDedupDecision::Capture
+            );
+
+            recapture(&database, "shot", ORIGINAL)
+                .await
+                .expect("revival after a consecutive match should persist");
+
+            assert_eq!(expired_flag(&database, "shot").await, 0);
+            assert_eq!(
+                lookup_stored_original(&database.pool, "hash-shot").await,
+                StoredOriginalLookup::Found {
+                    full_image_expired: false,
+                }
+            );
+            let mut revived = load_clip(&database, "shot").await;
+            let bytes = load_full_image_content(&database, &mut revived)
+                .await
+                .expect("consecutive revival should make the original usable");
+            assert_eq!(bytes, ORIGINAL);
+            assert_eq!(
+                consecutive_dedup_decision(StoredOriginalLookup::Found {
+                    full_image_expired: false,
+                }),
+                ConsecutiveDedupDecision::Skip
+            );
+
+            cleanup(&database);
+        }
+
+        /// SBS-769: a failed persist or a failed clip_images index must leave
+        /// `full_image_expired` set so copy/paste do not claim a missing original.
+        #[tokio::test]
+        async fn persist_or_index_failure_does_not_clear_expired_flag() {
+            let persist_fail_db = test_database().await;
+            seed_expired_image(&persist_fail_db, "shot", "hash-shot").await;
+            std::fs::write(&persist_fail_db.image_dir, b"not-a-directory")
+                .expect("image_dir should be a file so persist cannot create it");
+
+            let persist_err = recapture(&persist_fail_db, "shot", ORIGINAL)
+                .await
+                .expect_err("staging must fail when image_dir is a file");
+            assert!(
+                persist_err.contains("persist"),
+                "the error should describe the failed write: {persist_err}"
+            );
+            assert_eq!(expired_flag(&persist_fail_db, "shot").await, 1);
+            let persist_index_rows: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM clip_images WHERE clip_uuid = 'shot'")
+                    .fetch_one(&persist_fail_db.pool)
+                    .await
+                    .expect("clip_images count should load");
+            assert_eq!(persist_index_rows, 0);
+            let _ = std::fs::remove_file(&persist_fail_db.image_dir);
+
+            let index_fail_db = test_database().await;
+            seed_expired_image(&index_fail_db, "shot", "hash-shot").await;
+            sqlx::query("DROP TABLE clip_images")
+                .execute(&index_fail_db.pool)
+                .await
+                .expect("dropping clip_images should force an index failure");
+
+            let index_err = recapture(&index_fail_db, "shot", ORIGINAL)
+                .await
+                .expect_err("index must fail when clip_images is missing");
+            assert!(
+                index_err.contains("index"),
+                "the error should describe the failed index: {index_err}"
+            );
+            assert_eq!(expired_flag(&index_fail_db, "shot").await, 1);
+            // Review finding on PR #214: the write must not leave an orphan
+            // behind. The temp file is only renamed onto `{uuid}.cubby` after
+            // the SQL statements succeed; SBS-996 then commits the transaction.
+            // A failed index never reaches the rename, so it leaves neither an
+            // original nor a stray temp.
+            assert!(
+                !index_fail_db.image_dir.join("shot.cubby").exists(),
+                "a failed index must not leave an unindexed original behind"
+            );
+            assert!(
+                !index_fail_db.image_dir.join("shot.cubby.tmp").exists(),
+                "a failed index must not leave the staged temp file behind"
+            );
+
+            cleanup(&index_fail_db);
+        }
+
+        /// Review finding on PR #214: a non-consecutive duplicate re-copy
+        /// reaches the recapture with `full_image_expired` already 0, so the
+        /// path can hold a valid original that a live `clip_images` row points
+        /// at. A failed recapture must leave that file exactly as it was
+        /// rather than stranding the row that describes it.
+        #[tokio::test]
+        async fn a_failed_recapture_does_not_disturb_a_preexisting_original() {
+            let database = test_database().await;
+            seed_expired_image(&database, "shot", "hash-shot").await;
+            // Clear the expired flag to model an original that is already
+            // valid, then write the file this recapture would replace.
+            sqlx::query("UPDATE clips SET full_image_expired = 0 WHERE uuid = 'shot'")
+                .execute(&database.pool)
+                .await
+                .expect("clearing the expired flag should succeed");
+            let existing_path =
+                persist_full_image_file(&database.crypto, &database.image_dir, "shot", ORIGINAL)
+                    .expect("seeding the pre-existing original should succeed");
+            let existing_bytes =
+                std::fs::read(&existing_path).expect("the seeded original should be readable");
+
+            sqlx::query("DROP TABLE clip_images")
+                .execute(&database.pool)
+                .await
+                .expect("dropping clip_images should force an index failure");
+
+            let index_err = recapture(
+                &database,
+                "shot",
+                b"different-bytes-from-a-racing-recapture",
+            )
+            .await
+            .expect_err("index must fail when clip_images is missing");
+            assert!(
+                index_err.contains("index"),
+                "the error should describe the failed index: {index_err}"
+            );
+            assert_eq!(
+                std::fs::read(&existing_path).expect("the original must still be there"),
+                existing_bytes,
+                "a file that already existed must survive a failed recapture untouched"
+            );
+
+            cleanup(&database);
+        }
+
+        /// The whole point of SBS-769, end to end: one recapture is what makes
+        /// an expired clip usable again. Nothing runs after it to clear the
+        /// flag, so the row, the index, and the file must all be correct when
+        /// that single call returns.
+        #[tokio::test]
+        async fn one_recapture_leaves_the_clip_fully_usable() {
+            let database = test_database().await;
+            seed_expired_image(&database, "shot", "hash-shot").await;
+
+            recapture(&database, "shot", ORIGINAL)
+                .await
+                .expect("the recapture should succeed");
+
+            assert_eq!(
+                expired_flag(&database, "shot").await,
+                0,
+                "the recapture transaction must clear the expired flag itself"
+            );
+            let indexed: (String, i64) = sqlx::query_as(
+                "SELECT file_path, file_size FROM clip_images WHERE clip_uuid = 'shot'",
+            )
+            .fetch_one(&database.pool)
+            .await
+            .expect("the recapture should have indexed the original");
+            assert_eq!(indexed.1, ORIGINAL.len() as i64);
+            assert!(
+                std::path::Path::new(&indexed.0).exists(),
+                "clip_images must point at a file that is actually on disk"
+            );
+            let mut revived = load_clip(&database, "shot").await;
+            assert_eq!(
+                load_full_image_content(&database, &mut revived)
+                    .await
+                    .expect("Paste and Copy must work after one recapture"),
+                ORIGINAL
+            );
+
+            cleanup(&database);
+        }
+    }
+}

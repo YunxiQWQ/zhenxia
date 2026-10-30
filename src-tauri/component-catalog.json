@@ -1,0 +1,638 @@
+[
+  {
+    "id": "ocr-tiny",
+    "name": "PP-OCRv6 轻量",
+    "description": "离线文字识别；按需加载，使用后释放模型。",
+    "version": "1.2.0",
+    "kind": "ocr",
+    "resources": [
+      {
+        "url": "https://github.com/lxw112190/lw.PPOCR.C/releases/download/v1.2.0/lw.PPOCR.C-1.2.0-windows-x64-msvc.zip",
+        "sha256": "085a90a560921e05ab4b8f3906398c16a70096b9f5444b8a3bda257fae2243c3",
+        "format": "ocr-runtime",
+        "destination": ""
+      },
+      {
+        "url": "https://github.com/lxw112190/lw.PPOCR.C/releases/download/v1.2.0/lw.PPOCR.C-1.2.0-ppocrv6-tiny-runtime.zip",
+        "sha256": "47c8d23fb82310d57763edcb234e9b6f754942acc99741e6eb7cbd2f4afec6c9",
+        "format": "ocr-models",
+        "destination": ""
+      }
+    ],
+    "pairs": []
+  },
+  {
+    "id": "ocr-small",
+    "name": "PP-OCRv6 标准",
+    "description": "离线文字识别；按需加载，使用后释放模型。",
+    "version": "1.2.0",
+    "kind": "ocr",
+    "resources": [
+      {
+        "url": "https://github.com/lxw112190/lw.PPOCR.C/releases/download/v1.2.0/lw.PPOCR.C-1.2.0-windows-x64-msvc.zip",
+        "sha256": "085a90a560921e05ab4b8f3906398c16a70096b9f5444b8a3bda257fae2243c3",
+        "format": "ocr-runtime",
+        "destination": ""
+      },
+      {
+        "url": "https://github.com/lxw112190/lw.PPOCR.C/releases/download/v1.2.0/lw.PPOCR.C-1.2.0-ppocrv6-small-runtime.zip",
+        "sha256": "4520dff9b947903bc6cbc4cb5a65aaa094d4f8a0973b6ee62ee8a42a268f4240",
+        "format": "ocr-models",
+        "destination": ""
+      }
+    ],
+    "pairs": []
+  },
+  {
+    "id": "translate-zh-en",
+    "name": "简体中文 ↔ 英语",
+    "description": "Firefox 离线翻译语言包；可通过英语中转。",
+    "version": "Bergamot 0.5.1",
+    "kind": "translation",
+    "resources": [
+      {
+        "url": "https://api.nuget.org/v3-flatcontainer/bergamottranslatorsharp/0.5.1/bergamottranslatorsharp.0.5.1.nupkg",
+        "sha256": null,
+        "format": "translation-runtime",
+        "destination": "runtime"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/zh-en/cjk_icu_base_LQeOIbF7Sbq3XA8lsRPotw/exported/model.zhen.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/zh-en/model.zhen.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/zh-en/cjk_icu_base_LQeOIbF7Sbq3XA8lsRPotw/exported/lex.50.50.zhen.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/zh-en/lex.50.50.zhen.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/zh-en/cjk_icu_base_LQeOIbF7Sbq3XA8lsRPotw/exported/vocab.zhen.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/zh-en/vocab.zhen.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-zh/llmaat_finetune10M_qe8_f2_ByQcSxGXQRqGi-UTxYE43g/exported/model.enzh.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-zh/model.enzh.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-zh/llmaat_finetune10M_qe8_f2_ByQcSxGXQRqGi-UTxYE43g/exported/lex.50.50.enzh.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-zh/lex.50.50.enzh.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-zh/llmaat_finetune10M_qe8_f2_ByQcSxGXQRqGi-UTxYE43g/exported/srcvocab.enzh.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-zh/srcvocab.enzh.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-zh/llmaat_finetune10M_qe8_f2_ByQcSxGXQRqGi-UTxYE43g/exported/trgvocab.enzh.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-zh/trgvocab.enzh.spm"
+      }
+    ],
+    "pairs": [
+      {
+        "id": "zh-en",
+        "model": "model.zhen.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.zhen.s2t.bin",
+        "vocab": [
+          "vocab.zhen.spm",
+          "vocab.zhen.spm"
+        ]
+      },
+      {
+        "id": "en-zh",
+        "model": "model.enzh.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.enzh.s2t.bin",
+        "vocab": [
+          "srcvocab.enzh.spm",
+          "trgvocab.enzh.spm"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "translate-zh-Hant",
+    "name": "繁体中文 ↔ 英语",
+    "description": "Firefox 离线翻译语言包；可通过英语中转。",
+    "version": "Bergamot 0.5.1",
+    "kind": "translation",
+    "resources": [
+      {
+        "url": "https://api.nuget.org/v3-flatcontainer/bergamottranslatorsharp/0.5.1/bergamottranslatorsharp.0.5.1.nupkg",
+        "sha256": null,
+        "format": "translation-runtime",
+        "destination": "runtime"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/zh_hant-en/zh_hant_openlid_zh_tw_lr0002_WJi5Ozi7SZWC6hgfD5GhTA/exported/model.zh_hanten.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/zh_hant-en/model.zh_hanten.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/zh_hant-en/zh_hant_openlid_zh_tw_lr0002_WJi5Ozi7SZWC6hgfD5GhTA/exported/lex.50.50.zh_hanten.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/zh_hant-en/lex.50.50.zh_hanten.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/zh_hant-en/zh_hant_openlid_zh_tw_lr0002_WJi5Ozi7SZWC6hgfD5GhTA/exported/srcvocab.zh_hanten.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/zh_hant-en/srcvocab.zh_hanten.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/zh_hant-en/zh_hant_openlid_zh_tw_lr0002_WJi5Ozi7SZWC6hgfD5GhTA/exported/trgvocab.zh_hanten.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/zh_hant-en/trgvocab.zh_hanten.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-zh_hant/zh_hant_llmaat_finetune10M_qe8_f2_aQ8azdOMQOSBVjBDOVDIZQ/exported/model.enzh_hant.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-zh_hant/model.enzh_hant.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-zh_hant/zh_hant_llmaat_finetune10M_qe8_f2_aQ8azdOMQOSBVjBDOVDIZQ/exported/lex.50.50.enzh_hant.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-zh_hant/lex.50.50.enzh_hant.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-zh_hant/zh_hant_llmaat_finetune10M_qe8_f2_aQ8azdOMQOSBVjBDOVDIZQ/exported/srcvocab.enzh_hant.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-zh_hant/srcvocab.enzh_hant.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-zh_hant/zh_hant_llmaat_finetune10M_qe8_f2_aQ8azdOMQOSBVjBDOVDIZQ/exported/trgvocab.enzh_hant.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-zh_hant/trgvocab.enzh_hant.spm"
+      }
+    ],
+    "pairs": [
+      {
+        "id": "zh_hant-en",
+        "model": "model.zh_hanten.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.zh_hanten.s2t.bin",
+        "vocab": [
+          "srcvocab.zh_hanten.spm",
+          "trgvocab.zh_hanten.spm"
+        ]
+      },
+      {
+        "id": "en-zh_hant",
+        "model": "model.enzh_hant.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.enzh_hant.s2t.bin",
+        "vocab": [
+          "srcvocab.enzh_hant.spm",
+          "trgvocab.enzh_hant.spm"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "translate-ru",
+    "name": "俄语 ↔ 英语",
+    "description": "Firefox 离线翻译语言包；可通过英语中转。",
+    "version": "Bergamot 0.5.1",
+    "kind": "translation",
+    "resources": [
+      {
+        "url": "https://api.nuget.org/v3-flatcontainer/bergamottranslatorsharp/0.5.1/bergamottranslatorsharp.0.5.1.nupkg",
+        "sha256": null,
+        "format": "translation-runtime",
+        "destination": "runtime"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/ru-en/spring-2024_QrcdYgbwS7e7xbhtOSdoNQ/exported/model.ruen.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/ru-en/model.ruen.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/ru-en/spring-2024_QrcdYgbwS7e7xbhtOSdoNQ/exported/lex.50.50.ruen.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/ru-en/lex.50.50.ruen.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/ru-en/spring-2024_QrcdYgbwS7e7xbhtOSdoNQ/exported/vocab.ruen.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/ru-en/vocab.ruen.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ru/student_base_AYqN3ysXRp2EGkEqeaA5Rg/exported/model.enru.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ru/model.enru.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ru/student_base_AYqN3ysXRp2EGkEqeaA5Rg/exported/lex.50.50.enru.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ru/lex.50.50.enru.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ru/student_base_AYqN3ysXRp2EGkEqeaA5Rg/exported/vocab.enru.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ru/vocab.enru.spm"
+      }
+    ],
+    "pairs": [
+      {
+        "id": "ru-en",
+        "model": "model.ruen.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.ruen.s2t.bin",
+        "vocab": [
+          "vocab.ruen.spm",
+          "vocab.ruen.spm"
+        ]
+      },
+      {
+        "id": "en-ru",
+        "model": "model.enru.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.enru.s2t.bin",
+        "vocab": [
+          "vocab.enru.spm",
+          "vocab.enru.spm"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "translate-ko",
+    "name": "韩语 ↔ 英语",
+    "description": "Firefox 离线翻译语言包；可通过英语中转。",
+    "version": "Bergamot 0.5.1",
+    "kind": "translation",
+    "resources": [
+      {
+        "url": "https://api.nuget.org/v3-flatcontainer/bergamottranslatorsharp/0.5.1/bergamottranslatorsharp.0.5.1.nupkg",
+        "sha256": null,
+        "format": "translation-runtime",
+        "destination": "runtime"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/ko-en/cjk_icu_base_BnKgBdd0Rzq87oUYN3L9-A/exported/model.koen.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/ko-en/model.koen.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/ko-en/cjk_icu_base_BnKgBdd0Rzq87oUYN3L9-A/exported/lex.50.50.koen.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/ko-en/lex.50.50.koen.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/ko-en/cjk_icu_base_BnKgBdd0Rzq87oUYN3L9-A/exported/vocab.koen.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/ko-en/vocab.koen.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ko/cjk_hplt2_Fzrv_XPwTs6KVNkktUeuOA/exported/model.enko.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ko/model.enko.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ko/cjk_hplt2_Fzrv_XPwTs6KVNkktUeuOA/exported/lex.50.50.enko.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ko/lex.50.50.enko.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ko/cjk_hplt2_Fzrv_XPwTs6KVNkktUeuOA/exported/vocab.enko.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ko/vocab.enko.spm"
+      }
+    ],
+    "pairs": [
+      {
+        "id": "ko-en",
+        "model": "model.koen.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.koen.s2t.bin",
+        "vocab": [
+          "vocab.koen.spm",
+          "vocab.koen.spm"
+        ]
+      },
+      {
+        "id": "en-ko",
+        "model": "model.enko.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.enko.s2t.bin",
+        "vocab": [
+          "vocab.enko.spm",
+          "vocab.enko.spm"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "translate-ja",
+    "name": "日语 ↔ 英语",
+    "description": "Firefox 离线翻译语言包；可通过英语中转。",
+    "version": "Bergamot 0.5.1",
+    "kind": "translation",
+    "resources": [
+      {
+        "url": "https://api.nuget.org/v3-flatcontainer/bergamottranslatorsharp/0.5.1/bergamottranslatorsharp.0.5.1.nupkg",
+        "sha256": null,
+        "format": "translation-runtime",
+        "destination": "runtime"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/ja-en/cjk_icu_base_U4VUAW3STh-bF0Sr-dX69g/exported/model.jaen.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/ja-en/model.jaen.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/ja-en/cjk_icu_base_U4VUAW3STh-bF0Sr-dX69g/exported/lex.50.50.jaen.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/ja-en/lex.50.50.jaen.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/ja-en/cjk_icu_base_U4VUAW3STh-bF0Sr-dX69g/exported/vocab.jaen.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/ja-en/vocab.jaen.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ja/llmaat_finetune10M_qe8_f2_ApiGGQIwTKuF9i_k3n9Q2Q/exported/model.enja.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ja/model.enja.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ja/llmaat_finetune10M_qe8_f2_ApiGGQIwTKuF9i_k3n9Q2Q/exported/lex.50.50.enja.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ja/lex.50.50.enja.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ja/llmaat_finetune10M_qe8_f2_ApiGGQIwTKuF9i_k3n9Q2Q/exported/srcvocab.enja.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ja/srcvocab.enja.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-ja/llmaat_finetune10M_qe8_f2_ApiGGQIwTKuF9i_k3n9Q2Q/exported/trgvocab.enja.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-ja/trgvocab.enja.spm"
+      }
+    ],
+    "pairs": [
+      {
+        "id": "ja-en",
+        "model": "model.jaen.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.jaen.s2t.bin",
+        "vocab": [
+          "vocab.jaen.spm",
+          "vocab.jaen.spm"
+        ]
+      },
+      {
+        "id": "en-ja",
+        "model": "model.enja.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.enja.s2t.bin",
+        "vocab": [
+          "srcvocab.enja.spm",
+          "trgvocab.enja.spm"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "translate-fr",
+    "name": "法语 ↔ 英语",
+    "description": "Firefox 离线翻译语言包；可通过英语中转。",
+    "version": "Bergamot 0.5.1",
+    "kind": "translation",
+    "resources": [
+      {
+        "url": "https://api.nuget.org/v3-flatcontainer/bergamottranslatorsharp/0.5.1/bergamottranslatorsharp.0.5.1.nupkg",
+        "sha256": null,
+        "format": "translation-runtime",
+        "destination": "runtime"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/fr-en/retrain_hr_EFgIftH_RrCyzl5gjemVNg/exported/model.fren.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/fr-en/model.fren.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/fr-en/retrain_hr_EFgIftH_RrCyzl5gjemVNg/exported/lex.50.50.fren.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/fr-en/lex.50.50.fren.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/fr-en/retrain_hr_EFgIftH_RrCyzl5gjemVNg/exported/vocab.fren.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/fr-en/vocab.fren.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-fr/retrain_hr_NLIxDbE1TBGyOTI-zwZagw/exported/model.enfr.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-fr/model.enfr.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-fr/retrain_hr_NLIxDbE1TBGyOTI-zwZagw/exported/lex.50.50.enfr.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-fr/lex.50.50.enfr.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-fr/retrain_hr_NLIxDbE1TBGyOTI-zwZagw/exported/vocab.enfr.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-fr/vocab.enfr.spm"
+      }
+    ],
+    "pairs": [
+      {
+        "id": "fr-en",
+        "model": "model.fren.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.fren.s2t.bin",
+        "vocab": [
+          "vocab.fren.spm",
+          "vocab.fren.spm"
+        ]
+      },
+      {
+        "id": "en-fr",
+        "model": "model.enfr.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.enfr.s2t.bin",
+        "vocab": [
+          "vocab.enfr.spm",
+          "vocab.enfr.spm"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "translate-es",
+    "name": "西班牙语 ↔ 英语",
+    "description": "Firefox 离线翻译语言包；可通过英语中转。",
+    "version": "Bergamot 0.5.1",
+    "kind": "translation",
+    "resources": [
+      {
+        "url": "https://api.nuget.org/v3-flatcontainer/bergamottranslatorsharp/0.5.1/bergamottranslatorsharp.0.5.1.nupkg",
+        "sha256": null,
+        "format": "translation-runtime",
+        "destination": "runtime"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/es-en/retrain_hr_HbNjJ60BTwmVTbhfFxuduA/exported/model.esen.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/es-en/model.esen.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/es-en/retrain_hr_HbNjJ60BTwmVTbhfFxuduA/exported/lex.50.50.esen.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/es-en/lex.50.50.esen.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/es-en/retrain_hr_HbNjJ60BTwmVTbhfFxuduA/exported/vocab.esen.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/es-en/vocab.esen.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-es/retrain_hr_fix_names_CUAEXUHoQum_cFqh-ZAryw/exported/model.enes.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-es/model.enes.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-es/retrain_hr_fix_names_CUAEXUHoQum_cFqh-ZAryw/exported/lex.50.50.enes.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-es/lex.50.50.enes.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-es/retrain_hr_fix_names_CUAEXUHoQum_cFqh-ZAryw/exported/vocab.enes.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-es/vocab.enes.spm"
+      }
+    ],
+    "pairs": [
+      {
+        "id": "es-en",
+        "model": "model.esen.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.esen.s2t.bin",
+        "vocab": [
+          "vocab.esen.spm",
+          "vocab.esen.spm"
+        ]
+      },
+      {
+        "id": "en-es",
+        "model": "model.enes.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.enes.s2t.bin",
+        "vocab": [
+          "vocab.enes.spm",
+          "vocab.enes.spm"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "translate-de",
+    "name": "德语 ↔ 英语",
+    "description": "Firefox 离线翻译语言包；可通过英语中转。",
+    "version": "Bergamot 0.5.1",
+    "kind": "translation",
+    "resources": [
+      {
+        "url": "https://api.nuget.org/v3-flatcontainer/bergamottranslatorsharp/0.5.1/bergamottranslatorsharp.0.5.1.nupkg",
+        "sha256": null,
+        "format": "translation-runtime",
+        "destination": "runtime"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/de-en/retrain_hr2_WZOW24i4QJmIib61LeHfwg/exported/model.deen.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/de-en/model.deen.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/de-en/retrain_hr2_WZOW24i4QJmIib61LeHfwg/exported/lex.50.50.deen.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/de-en/lex.50.50.deen.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/de-en/retrain_hr2_WZOW24i4QJmIib61LeHfwg/exported/vocab.deen.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/de-en/vocab.deen.spm"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-de/retrain_hr_fix_names_SCgGhxUPQ2WAECHLRtzrMg/exported/model.ende.intgemm.alphas.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-de/model.ende.intgemm.alphas.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-de/retrain_hr_fix_names_SCgGhxUPQ2WAECHLRtzrMg/exported/lex.50.50.ende.s2t.bin.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-de/lex.50.50.ende.s2t.bin"
+      },
+      {
+        "url": "https://storage.googleapis.com/moz-fx-translations-data--303e-prod-translations-data/models/en-de/retrain_hr_fix_names_SCgGhxUPQ2WAECHLRtzrMg/exported/vocab.ende.spm.gz",
+        "sha256": null,
+        "format": "gzip",
+        "destination": "models/en-de/vocab.ende.spm"
+      }
+    ],
+    "pairs": [
+      {
+        "id": "de-en",
+        "model": "model.deen.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.deen.s2t.bin",
+        "vocab": [
+          "vocab.deen.spm",
+          "vocab.deen.spm"
+        ]
+      },
+      {
+        "id": "en-de",
+        "model": "model.ende.intgemm.alphas.bin",
+        "lexicon": "lex.50.50.ende.s2t.bin",
+        "vocab": [
+          "vocab.ende.spm",
+          "vocab.ende.spm"
+        ]
+      }
+    ]
+  }
+]

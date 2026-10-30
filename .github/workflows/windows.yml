@@ -1,0 +1,29 @@
+name: Windows build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '9.15.9'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test -- --maxWorkers=2
+      - run: pnpm build
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib scroll_stitch::tests -- --test-threads=1
+      - run: cargo build --locked --release --manifest-path src-tauri/Cargo.toml --bin cubby
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zhenxia-Windows-x64
+          path: src-tauri/target/release/cubby.exe

@@ -1,0 +1,1781 @@
+//! Windows / macOS 截屏：委托 xcap（这两个平台上走系统 API，无 C 编译依赖）。
+
+use crate::{CaptureError, Result, Screenshot};
+use xcap::Monitor;
+
+fn err<E: std::fmt::Display>(e: E) -> CaptureError {
+    CaptureError(e.to_string())
+}
+
+fn shoot(monitor: &Monitor) -> Result<Screenshot> {
+    let img = monitor.capture_image().map_err(err)?;
+    let (width, height) = (img.width(), img.height());
+    Ok(Screenshot {
+        rgba: img.into_raw(),
+        width,
+        height,
+        origin: (monitor.x().map_err(err)?, monitor.y().map_err(err)?),
+        scale: monitor.scale_factor().map_err(err)?,
+        is_primary: monitor.is_primary().unwrap_or(false),
+    })
+}
+
+pub fn capture_primary() -> Result<Screenshot> {
+    let monitors = Monitor::all().map_err(err)?;
+    let primary = monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .or_else(|| monitors.first())
+        .ok_or_else(|| CaptureError("no monitor found".into()))?;
+    shoot(primary)
+}
+
+/// Win：`Monitor::from_point` 收物理像素（DPI 感知进程坐标系一致）。
+#[cfg(not(target_os = "macos"))]
+pub fn capture_at(x: i32, y: i32) -> Result<Screenshot> {
+    shoot(&Monitor::from_point(x, y).map_err(err)?)
+}
+
+/// mac：上游传物理像素（cursor_position/CLI），`from_point` 却收 CG 逻辑点，
+/// retina 下直接传会定位到错误的屏——先按物理包围盒定位再截。
+#[cfg(target_os = "macos")]
+pub fn capture_at(x: i32, y: i32) -> Result<Screenshot> {
+    let monitors = Monitor::all().map_err(err)?;
+    let screens = mac::screens(&monitors);
+    let monitor = mac::idx_at_physical(&screens, x, y)
+        .and_then(|i| monitors.get(i))
+        .or_else(|| monitors.first())
+        .ok_or_else(|| CaptureError("no monitor found".into()))?;
+    shoot(monitor)
+}
+
+pub fn capture_all() -> Result<Vec<Screenshot>> {
+    Monitor::all().map_err(err)?.iter().map(shoot).collect()
+}
+
+/// Win/mac 覆盖层不走跨屏单缓冲路径（capture_span 仅 Linux），此处仅为
+/// 平台 API 完整性：并集 = 各屏包围盒。
+pub fn capture_desktop() -> Result<Screenshot> {
+    let monitors = Monitor::all().map_err(err)?;
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for m in &monitors {
+        let (x, y) = (m.x().map_err(err)?, m.y().map_err(err)?);
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x + m.width().map_err(err)? as i32);
+        y1 = y1.max(y + m.height().map_err(err)? as i32);
+    }
+    if x1 <= x0 || y1 <= y0 {
+        return Err(CaptureError("no monitor found".into()));
+    }
+    // xcap 无跨屏抓取：截主屏（union 含主屏）作为降级——上层 Windows/macOS
+    // 的覆盖层本来就不调用本函数（走 capture_at + fullscreen 老路径）。
+    capture_primary()
+}
+
+pub fn desktop_layout() -> Result<(crate::MonitorRect, crate::MonitorRect)> {
+    let monitors = Monitor::all().map_err(err)?;
+    let primary = monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .or_else(|| monitors.first())
+        .ok_or_else(|| CaptureError("no monitor found".into()))?;
+    let mut x0 = i32::MAX;
+    let mut y0 = i32::MAX;
+    let mut x1 = i32::MIN;
+    let mut y1 = i32::MIN;
+    for m in &monitors {
+        let (x, y) = (m.x().map_err(err)?, m.y().map_err(err)?);
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x + m.width().map_err(err)? as i32);
+        y1 = y1.max(y + m.height().map_err(err)? as i32);
+    }
+    Ok((
+        (x0, y0, (x1 - x0) as u32, (y1 - y0) as u32),
+        (
+            primary.x().map_err(err)?,
+            primary.y().map_err(err)?,
+            primary.width().map_err(err)?,
+            primary.height().map_err(err)?,
+        ),
+    ))
+}
+
+// ------------------------------------------------- macOS 坐标/事件辅助
+//
+// 坐标约定：本 crate 对外一律物理像素；而 macOS 上 xcap 的显示器几何
+// （CGDisplayBounds）与 CG 事件 API 均为 CG 全局逻辑点（主屏左上原点）。
+// 换算约定与 list_windows 一致：**全局逻辑点 × 所在屏 scale = 物理像素**
+// （retina = 2.0 等），反向除回。截屏位图（CGWindowListCreateImage）本身
+// 按 backing store 物理分辨率出图，与 Linux/Win 一致。
+// 已知限制：多屏混合 DPI 时逻辑坐标系没有对应的全物理虚拟桌面，跨屏
+// 选区的换算只在选区所在屏内精确（选区链路按物理像素设计，见
+// pick_region_interactive）。
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::Monitor;
+
+    /// CG CGPoint（repr(C) 与系统 ABI 一致）
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGPoint {
+        pub x: f64,
+        pub y: f64,
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        pub fn CFRelease(cf: *mut core::ffi::c_void);
+        pub fn CFStringCreateWithCString(
+            alloc: *mut core::ffi::c_void,
+            c_str: *const i8,
+            encoding: u32,
+        ) -> *mut core::ffi::c_void;
+        pub fn CFPreferencesCopyAppValue(
+            key: *mut core::ffi::c_void,
+            app_id: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        pub fn CFGetTypeID(cf: *mut core::ffi::c_void) -> usize;
+        pub fn CFBooleanGetTypeID() -> usize;
+        pub fn CFBooleanGetValue(boolean: *mut core::ffi::c_void) -> bool;
+    }
+
+    /// kCFStringEncodingUTF8
+    const CF_UTF8: u32 = 0x0800_0100;
+
+    /// 「自然滚动」是否开启（进程内缓存）。开启时会话层注入的滚轮增量
+    /// 会被系统再翻转一次——scroll_wheel 的负增量本意为「向下」，自然
+    /// 滚动下实际向**上**滚（真机实测：页面滚向顶部 → 拼接器全程
+    /// NoChange → 滚动截图必回退普通截图）。未设置时按 macOS 默认
+    /// （自然滚动开）处理
+    pub fn natural_scrolling_on() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| unsafe {
+            let key = CFStringCreateWithCString(
+                std::ptr::null_mut(),
+                c"com.apple.swipescrolldirection".as_ptr(),
+                CF_UTF8,
+            );
+            let domain = CFStringCreateWithCString(
+                std::ptr::null_mut(),
+                c"NSGlobalDomain".as_ptr(),
+                CF_UTF8,
+            );
+            let v = if key.is_null() || domain.is_null() {
+                std::ptr::null_mut()
+            } else {
+                CFPreferencesCopyAppValue(key, domain)
+            };
+            let on = if !v.is_null() && CFGetTypeID(v) == CFBooleanGetTypeID() {
+                CFBooleanGetValue(v)
+            } else {
+                true // 读取失败/未设置 = 默认自然滚动开
+            };
+            if !v.is_null() {
+                CFRelease(v);
+            }
+            if !key.is_null() {
+                CFRelease(key);
+            }
+            if !domain.is_null() {
+                CFRelease(domain);
+            }
+            on
+        })
+    }
+
+    // CoreGraphics：滚轮合成 / 指针控制 / 指针查询（系统框架直连，零新依赖）
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        pub fn CGEventCreate(source: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        pub fn CGEventGetLocation(event: *mut core::ffi::c_void) -> CGPoint;
+        pub fn CGEventSourceCreate(state_id: u32) -> *mut core::ffi::c_void;
+        pub fn CGEventCreateScrollWheelEvent(
+            source: *mut core::ffi::c_void,
+            units: u32,
+            wheel_count: u32,
+            ...
+        ) -> *mut core::ffi::c_void;
+        pub fn CGEventPost(tap: u32, event: *mut core::ffi::c_void);
+        pub fn CGWarpMouseCursorPosition(new_position: CGPoint) -> i32;
+        // CGEventSourceButtonState（全局硬件按键查询）刻意不声明：macOS 15.3
+        // 真机低频查询即触发 SkyLight 事件源注册表死锁，mac 的 pointer_state
+        // 已降级返回 None（详见其文档），声明留着只会引诱后人踩坑
+    }
+
+    /// kCGEventSourceStateHIDSystemState（合成滚轮事件源的标准状态）
+    pub const SOURCE_HID: u32 = 1;
+    /// kCGSessionEventTap：注入会话层，方向不被「自然滚动」系统设置翻转
+    pub const SESSION_TAP: u32 = 1;
+
+    /// 一台显示器的几何快照：scale + CG 逻辑包围盒
+    pub struct Screen {
+        pub scale: f32,
+        pub x: f64,
+        pub y: f64,
+        pub w: f64,
+        pub h: f64,
+    }
+
+    pub fn screens(monitors: &[Monitor]) -> Vec<Screen> {
+        monitors
+            .iter()
+            .filter_map(|m| {
+                let scale = m.scale_factor().ok()?;
+                Some(Screen {
+                    scale: if scale > 0.0 { scale } else { 1.0 },
+                    x: m.x().ok()? as f64,
+                    y: m.y().ok()? as f64,
+                    w: m.width().ok()? as f64,
+                    h: m.height().ok()? as f64,
+                })
+            })
+            .collect()
+    }
+
+    /// 物理点落在哪台屏（物理包围盒 = 逻辑包围盒 × 各自 scale），返回下标
+    pub fn idx_at_physical(screens: &[Screen], x: i32, y: i32) -> Option<usize> {
+        let (xf, yf) = (x as f64, y as f64);
+        screens.iter().position(|s| {
+            let k = s.scale as f64;
+            xf >= s.x * k && xf < (s.x + s.w) * k && yf >= s.y * k && yf < (s.y + s.h) * k
+        })
+    }
+
+    /// CG 逻辑点落在哪台屏，返回下标
+    pub fn idx_at_logical(screens: &[Screen], x: f64, y: f64) -> Option<usize> {
+        screens
+            .iter()
+            .position(|s| x >= s.x && x < s.x + s.w && y >= s.y && y < s.y + s.h)
+    }
+
+    // ---------------------------------------- 窗口枚举（单次 CGWindowList 扫描）
+    //
+    // xcap 0.9.8 的 mac Window 每个字段访问器（x/y/width/height/title/app_name/
+    // is_minimized…）都各自重新全量扫一遍 CGWindowListCopyWindowInfo（见其
+    // get_window_cf_dictionary），上层逐字段读取即 N 窗口 × ~10 次全量枚举，
+    // 每次 GUI 启动叠加 frontmost_window 再翻倍——真机上这是截图入场延迟的
+    // 大头。这里直连 CFDictionary 一次扫完，同时放宽一条：kCGWindowName 缺失
+    // （无「屏幕录制」授权）时保留窗口、仅标题留空——窗口吸附不再依赖授权，
+    // xcap 的实现会把这类窗口整条丢弃。
+
+    /// kCGWindowListOptionOnScreenOnly
+    const WL_ON_SCREEN: u32 = 1 << 0;
+    /// kCGWindowListExcludeDesktopElements
+    const WL_EXCL_DESKTOP: u32 = 1 << 4;
+    /// kCFNumberSInt32Type（CFNumberGetValue 自动做类型转换，请求 32 位足够）
+    const CF_NUM_SINT32: u32 = 3;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: *const core::ffi::c_void) -> isize;
+        fn CFArrayGetValueAtIndex(
+            array: *const core::ffi::c_void,
+            idx: isize,
+        ) -> *const core::ffi::c_void;
+        fn CFDictionaryGetValue(
+            dict: *const core::ffi::c_void,
+            key: *const core::ffi::c_void,
+        ) -> *const core::ffi::c_void;
+        fn CFStringGetCString(
+            s: *const core::ffi::c_void,
+            buffer: *mut i8,
+            size: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFStringGetTypeID() -> usize;
+        fn CFNumberGetValue(
+            number: *const core::ffi::c_void,
+            the_type: u32,
+            value: *mut core::ffi::c_void,
+        ) -> u8;
+        fn CFNumberGetTypeID() -> usize;
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, limit: u32) -> *mut core::ffi::c_void;
+        fn CGRectMakeWithDictionaryRepresentation(
+            dict: *const core::ffi::c_void,
+            rect: *mut CGRect,
+        ) -> u8;
+        fn CGGetActiveDisplayList(max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
+        fn CGDisplayBounds(display: u32) -> CGRect;
+        fn CGDisplayCopyDisplayMode(display: u32) -> *mut core::ffi::c_void;
+        fn CGDisplayModeGetPixelWidth(mode: *const core::ffi::c_void) -> usize;
+        fn CGDisplayModeRelease(mode: *const core::ffi::c_void);
+    }
+
+    /// CGRectMakeWithDictionaryRepresentation / CGDisplayBounds 的返回布局
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGSize {
+        pub w: f64,
+        pub h: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct CGRect {
+        pub origin: CGPoint,
+        pub size: CGSize,
+    }
+
+    fn cf_str(s: &str) -> *mut core::ffi::c_void {
+        unsafe {
+            CFStringCreateWithCString(
+                std::ptr::null_mut(),
+                format!("{s}\0").as_ptr() as *const i8,
+                CF_UTF8,
+            )
+        }
+    }
+
+    unsafe fn dict_string(dict: *const core::ffi::c_void, key: *const core::ffi::c_void) -> String {
+        let v = CFDictionaryGetValue(dict, key);
+        if v.is_null() || CFGetTypeID(v as *mut _) != CFStringGetTypeID() {
+            return String::new();
+        }
+        let mut buf = [0u8; 1024];
+        if CFStringGetCString(v, buf.as_mut_ptr() as *mut i8, buf.len() as isize, CF_UTF8) == 0 {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr(buf.as_ptr() as *const i8)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    unsafe fn dict_i32(
+        dict: *const core::ffi::c_void,
+        key: *const core::ffi::c_void,
+    ) -> Option<i32> {
+        let v = CFDictionaryGetValue(dict, key);
+        if v.is_null() || CFGetTypeID(v as *mut _) != CFNumberGetTypeID() {
+            return None;
+        }
+        let mut out: i32 = 0;
+        (CFNumberGetValue(v, CF_NUM_SINT32, &mut out as *mut i32 as *mut _) != 0).then_some(out)
+    }
+
+    unsafe fn dict_rect(
+        dict: *const core::ffi::c_void,
+        key: *const core::ffi::c_void,
+    ) -> Option<CGRect> {
+        let v = CFDictionaryGetValue(dict, key);
+        if v.is_null() {
+            return None;
+        }
+        let mut r = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { w: 0.0, h: 0.0 },
+        };
+        (CGRectMakeWithDictionaryRepresentation(v, &mut r) != 0).then_some(r)
+    }
+
+    /// 一条枚举出的窗口记录：bounds 为 CG 全局逻辑点（kCGWindowBounds）。
+    pub struct RawWindow {
+        pub id: u32,
+        pub title: String,
+        pub x: f64,
+        pub y: f64,
+        pub w: f64,
+        pub h: f64,
+    }
+
+    /// 本程序窗口在 CGWindowList 里可能出现的 owner 名集合：
+    /// - CLI 直跑：owner = 可执行文件名（lscreen）
+    /// - 打包 .app：kCGWindowOwnerName 取的是**应用名**（LaterScreen.app →
+    ///   LaterScreen），与可执行文件名（lscreen）不同——只认后者时设置面板/
+    ///   历史面板等自家普通层窗口会漏进吸附列表，甚至顶成「最前窗口」预选
+    pub fn own_owner_names() -> Vec<String> {
+        let mut names = Vec::new();
+        let Ok(exe) = std::env::current_exe() else {
+            return names;
+        };
+        if let Some(stem) = exe.file_stem() {
+            names.push(stem.to_string_lossy().into_owned());
+        }
+        // 自底向上找最近的 .app 祖先目录，取 bundle 名
+        let mut p = exe.as_path();
+        while let Some(parent) = p.parent() {
+            p = parent;
+            if let Some(stem) = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".app"))
+            {
+                names.push(stem.to_owned());
+                break;
+            }
+        }
+        names
+    }
+
+    /// 单次枚举屏幕上的**普通层（layer 0）**窗口（Z 序自顶向下）。过滤：
+    /// 非零层辅助窗（菜单栏/状态项/Dock——Dock 底窗是整屏大窗、排在应用
+    /// 窗口之上，不滤会把悬停命中与「最前窗口」全吞成全屏）、共享态关闭
+    /// （= 抓不到内容）、StatusIndicator、零尺寸；本程序自己的窗口（贴图/
+    /// 状态窗）按 owner 名排除（两种名字都认，见 [`own_owner_names`]）。
+    /// kCGWindowName 缺失（无「屏幕录制」授权）时标题留空、窗口保留。
+    pub fn window_list_raw() -> Vec<RawWindow> {
+        let own_names = own_owner_names();
+        let (k_bounds, k_name, k_owner, k_number, k_layer, k_sharing) = (
+            cf_str("kCGWindowBounds"),
+            cf_str("kCGWindowName"),
+            cf_str("kCGWindowOwnerName"),
+            cf_str("kCGWindowNumber"),
+            cf_str("kCGWindowLayer"),
+            cf_str("kCGWindowSharingState"),
+        );
+        let mut out = Vec::new();
+        unsafe {
+            let arr = CGWindowListCopyWindowInfo(WL_ON_SCREEN | WL_EXCL_DESKTOP, 0);
+            if !arr.is_null() {
+                let n = CFArrayGetCount(arr);
+                for i in 0..n {
+                    let d = CFArrayGetValueAtIndex(arr, i);
+                    if d.is_null() {
+                        continue;
+                    }
+                    // kCGWindowName 缺失（无屏幕录制授权）时标题留空、窗口保留
+                    let title = dict_string(d, k_name);
+                    let owner = dict_string(d, k_owner);
+                    if title == "StatusIndicator" && owner == "Window Server" {
+                        continue;
+                    }
+                    if dict_i32(d, k_sharing) == Some(0) {
+                        continue;
+                    }
+                    // 只认普通层（应用窗口）：Dock/菜单栏/状态项全在更高层
+                    if dict_i32(d, k_layer) != Some(0) {
+                        continue;
+                    }
+                    let Some(id) = dict_i32(d, k_number) else {
+                        continue;
+                    };
+                    let Some(r) = dict_rect(d, k_bounds) else {
+                        continue;
+                    };
+                    if r.size.w <= 0.0 || r.size.h <= 0.0 {
+                        continue;
+                    }
+                    if !owner.is_empty() && own_names.iter().any(|n| owner.eq_ignore_ascii_case(n))
+                    {
+                        continue;
+                    }
+                    out.push(RawWindow {
+                        id: id as u32,
+                        title,
+                        x: r.origin.x,
+                        y: r.origin.y,
+                        w: r.size.w,
+                        h: r.size.h,
+                    });
+                }
+                CFRelease(arr);
+            }
+            for k in [k_bounds, k_name, k_owner, k_number, k_layer, k_sharing] {
+                if !k.is_null() {
+                    CFRelease(k);
+                }
+            }
+        }
+        out
+    }
+
+    /// 各活跃显示器的逻辑包围盒与缩放比（物理宽 / 逻辑宽）。枚举一次复用。
+    pub struct DisplayScale {
+        pub x: f64,
+        pub y: f64,
+        pub w: f64,
+        pub h: f64,
+        pub scale: f64,
+    }
+
+    pub fn display_scales() -> Vec<DisplayScale> {
+        let mut ids = [0u32; 16];
+        let mut n: u32 = 0;
+        let mut out = Vec::new();
+        unsafe {
+            if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
+                for &d in &ids[..n.min(16) as usize] {
+                    let bounds = CGDisplayBounds(d);
+                    if bounds.size.w <= 0.0 || bounds.size.h <= 0.0 {
+                        continue;
+                    }
+                    // 缩放比必须与截屏位图同口径：取「当前显示模式像素宽 / 逻辑宽」
+                    // （同 xcap Monitor::scale_factor）。不能用 CGDisplayPixelsWide——
+                    // GPU 缩放模式下它返回的是逻辑宽而非面板/模式物理宽（真机
+                    // 实测 1440 vs 2880），算出 scale=1 会让窗口矩形留在逻辑坐标，
+                    // 初始预选/吸附只有物理位图的 1/2 边长、贴在左上角。
+                    let mode = CGDisplayCopyDisplayMode(d);
+                    let px = if mode.is_null() {
+                        0
+                    } else {
+                        let px = CGDisplayModeGetPixelWidth(mode);
+                        CGDisplayModeRelease(mode);
+                        px
+                    };
+                    out.push(DisplayScale {
+                        x: bounds.origin.x,
+                        y: bounds.origin.y,
+                        w: bounds.size.w,
+                        h: bounds.size.h,
+                        scale: if px > 0 {
+                            px as f64 / bounds.size.w
+                        } else {
+                            1.0
+                        },
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// 逻辑点所在显示器的缩放比（窗口中心定位）；找不到所在屏回退 1.0
+    /// （与旧 xcap 路径的失败回退一致）。
+    pub fn scale_for_center(displays: &[DisplayScale], cx: f64, cy: f64) -> f64 {
+        displays
+            .iter()
+            .find(|d| cx >= d.x && cx < d.x + d.w && cy >= d.y && cy < d.y + d.h)
+            .map(|d| d.scale)
+            .filter(|s| *s > 0.0)
+            .unwrap_or(1.0)
+    }
+}
+
+/// Win/mac 无 Wayland 概念，恒 false。
+pub fn is_wayland() -> bool {
+    false
+}
+
+/// 交互式截图仅 Wayland portal 路径需要；Win/mac 走自绘覆盖层。
+pub fn capture_interactive() -> Result<Screenshot> {
+    Err(CaptureError("当前平台不支持交互式 portal 截图".into()))
+}
+
+/// Win：GetCursorPos，物理像素（截屏/边框同一坐标系）。
+#[cfg(windows)]
+pub fn cursor_position() -> Option<(i32, i32)> {
+    pointer_state().map(|(x, y, _)| (x, y))
+}
+
+/// Win：GetCursorPos + GetAsyncKeyState(VK_LBUTTON)，物理像素坐标系。
+/// GetAsyncKeyState 最高位 = 当前按住，无需窗口焦点。注意 GetAsyncKeyState /
+/// VK_LBUTTON 在 KeyboardAndMessaging 之外的 Input::KeyboardAndMouse 模块
+/// （SendInput 同源，feature 已开）。
+#[cfg(windows)]
+pub fn pointer_state() -> Option<(i32, i32, bool)> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut pt = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut pt) } == 0 {
+        return None;
+    }
+    // VK_LBUTTON 是 VIRTUAL_KEY（= u16 类型别名）；返回 i16 最高位 = 按下
+    let down = unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000 != 0;
+    Some((pt.x, pt.y, down))
+}
+
+/// mac：CGEventGetLocation 拿 CG 全局逻辑点，× 所在屏 scale 换算回物理像素
+/// （与截屏/选区同一坐标系）。
+#[cfg(target_os = "macos")]
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let ev = unsafe { mac::CGEventCreate(std::ptr::null_mut()) };
+    if ev.is_null() {
+        return None;
+    }
+    let pt = unsafe { mac::CGEventGetLocation(ev) };
+    unsafe { mac::CFRelease(ev) };
+    let monitors = Monitor::all().ok()?;
+    let screens = mac::screens(&monitors);
+    let s = mac::idx_at_logical(&screens, pt.x, pt.y).and_then(|i| screens.get(i))?;
+    let k = s.scale as f64;
+    Some(((pt.x * k).round() as i32, (pt.y * k).round() as i32))
+}
+
+/// mac：坐标同 cursor_position，按键态**不可用**。
+///
+/// `CGEventSourceButtonState`（64 位下唯一公开的全局硬件按键 API）在
+/// 真机（Intel / macOS 15.3）低频查询即触发 SkyLight 事件源注册表的
+/// `CGSEventSourceForID → CGSEventSourceShutdown` 内部互斥锁**死锁**——
+/// 与查询频率、源类型（HID/CombinedSession）、是否伴随截屏无关
+/// （最小隔离实验见 M14 真机点验记录），v0.10.x 的 mac 录屏因此第一帧
+/// 即整段挂死。返回 None 让点击高亮按 M14 约定静默关闭；指针**位置**
+/// 仍由 [`cursor_position`] 提供（走 CGEventCreate 路径，实测安全，
+/// 贴图拖动/滚动截图依赖它）。上游系统修复后可恢复实现。
+#[cfg(target_os = "macos")]
+pub fn pointer_state() -> Option<(i32, i32, bool)> {
+    None
+}
+
+/// 其余平台（理论上仅剩非 Win/mac 的移植目标）：返回 None 时上层回退主显示器
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn cursor_position() -> Option<(i32, i32)> {
+    None
+}
+
+/// 其余平台：无指针查询，上层应把点击高亮整体降级
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn pointer_state() -> Option<(i32, i32, bool)> {
+    None
+}
+
+// ------------------------------------------------- 窗口枚举（M9）
+
+use crate::WindowInfo;
+
+/// mac 走本文件的 `mac::window_list_raw` 单次扫描（见该函数文档：xcap 的
+/// 每字段重扫在窗口多时是百毫秒级）；Win 委托 xcap——`Window::all()` 按
+/// Z 序自顶向下返回（EnumWindows），且已过滤不可见/工具窗口/本进程窗口。
+pub fn list_windows() -> Vec<WindowInfo> {
+    #[cfg(target_os = "macos")]
+    {
+        let displays = mac::display_scales();
+        let list = mac::window_list_raw();
+        let n = list.len();
+        list.into_iter()
+            .enumerate()
+            .map(|(i, w)| mac_to_window_info(w, (n - i) as u32, &displays))
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let Ok(windows) = xcap::Window::all() else {
+            return Vec::new();
+        };
+        // 排除自家其他进程（贴图/录制状态窗）：Windows 的 app_name = 进程 exe 名，
+        // mac = 应用名；与自身可执行文件名比对（大小写不敏感）
+        let own_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()));
+        let n = windows.len();
+        let mut out = Vec::new();
+        for (i, w) in windows.iter().enumerate() {
+            let (Ok(width), Ok(height)) = (w.width(), w.height()) else {
+                continue;
+            };
+            if width == 0 || height == 0 || w.is_minimized().unwrap_or(false) {
+                continue;
+            }
+            if let (Some(own), Ok(app)) = (&own_exe, w.app_name()) {
+                if app.eq_ignore_ascii_case(own) {
+                    continue;
+                }
+            }
+            let (x, y) = (w.x().unwrap_or(0), w.y().unwrap_or(0));
+            out.push(WindowInfo {
+                id: w.id().unwrap_or(0) as u64,
+                title: w.title().unwrap_or_default(),
+                x,
+                y,
+                width,
+                height,
+                z_order: (n - i) as u32,
+                is_minimized: false,
+            });
+        }
+        out
+    }
+}
+
+/// 当前最前（活跃）窗口。取不到活跃窗口时退回 Z 序最顶的普通窗口。
+pub fn frontmost_window() -> Option<WindowInfo> {
+    #[cfg(target_os = "macos")]
+    {
+        // 枚举已只保留普通层应用窗口：首位即视觉最前者
+        list_windows().into_iter().next()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let list = list_windows();
+        if list.is_empty() {
+            return None;
+        }
+        // Win = GetForegroundWindow（取不到前台/活跃窗口退回列表首个）
+        xcap::Window::all()
+            .ok()
+            .and_then(|ws| {
+                ws.iter()
+                    .find(|w| w.is_focused().unwrap_or(false))
+                    .and_then(|w| w.id().ok())
+            })
+            .and_then(|id| list.iter().find(|i| i.id == id as u64))
+            .cloned()
+            .or_else(|| list.first().cloned())
+    }
+}
+
+/// mac：枚举记录（CG 逻辑点）→ 物理像素 WindowInfo，按窗口中心所在屏的
+/// 缩放比换算，与 `Screenshot` 坐标系对齐（同 list_windows 旧换算约定）。
+#[cfg(target_os = "macos")]
+fn mac_to_window_info(
+    w: mac::RawWindow,
+    z_order: u32,
+    displays: &[mac::DisplayScale],
+) -> WindowInfo {
+    let scale = mac::scale_for_center(displays, w.x + w.w / 2.0, w.y + w.h / 2.0);
+    WindowInfo {
+        id: w.id as u64,
+        title: w.title,
+        x: (w.x * scale).round() as i32,
+        y: (w.y * scale).round() as i32,
+        width: (w.w * scale).round() as u32,
+        height: (w.h * scale).round() as u32,
+        z_order,
+        is_minimized: false,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn capture_region(x: i32, y: i32, w: u32, h: u32) -> Result<Screenshot> {
+    // xcap 的 capture_region 是显示器相对坐标；先定位区域左上角所在显示器
+    let monitor = Monitor::from_point(x, y).map_err(err)?;
+    let (mx, my) = (monitor.x().map_err(err)?, monitor.y().map_err(err)?);
+    let rel_x = (x - mx).max(0) as u32;
+    let rel_y = (y - my).max(0) as u32;
+    let img = monitor.capture_region(rel_x, rel_y, w, h).map_err(err)?;
+    let (width, height) = (img.width(), img.height());
+    Ok(Screenshot {
+        rgba: img.into_raw(),
+        width,
+        height,
+        origin: (x, y),
+        scale: monitor.scale_factor().map_err(err)?,
+        is_primary: false,
+    })
+}
+
+/// mac：上游（覆盖层选区/CLI --region）全是物理像素，而 xcap mac 的
+/// `capture_region` 收显示器相对的 **CG 逻辑点**——retina 下原样传会采到
+/// 2 倍大且偏移的区域，全屏选区更会被边界校验直接拒绝。先按物理包围盒
+/// 定位显示器，再把选区换算成显示器相对逻辑矩形（round 保证同输入同
+/// 输出，滚动拼接要求帧宽恒定）。返回帧按 backing store 物理分辨率出图。
+#[cfg(target_os = "macos")]
+pub fn capture_region(x: i32, y: i32, w: u32, h: u32) -> Result<Screenshot> {
+    let monitors = Monitor::all().map_err(err)?;
+    let screens = mac::screens(&monitors);
+    let Some(i) = mac::idx_at_physical(&screens, x, y) else {
+        return Err(CaptureError("区域超出屏幕范围".into()));
+    };
+    let (monitor, s) = (&monitors[i], screens[i].scale as f64);
+    let (lx, ly, lw, lh) = (screens[i].x, screens[i].y, screens[i].w, screens[i].h);
+    // 物理 → 显示器相对逻辑点（全局逻辑 = 物理 ÷ 所在屏 scale）
+    let rel_x = ((x as f64 / s) - lx).round().max(0.0);
+    let rel_y = ((y as f64 / s) - ly).round().max(0.0);
+    let rel_w = ((w as f64 / s).round().max(1.0)).min(lw - rel_x).max(1.0);
+    let rel_h = ((h as f64 / s).round().max(1.0)).min(lh - rel_y).max(1.0);
+    let img = monitor
+        .capture_region(rel_x as u32, rel_y as u32, rel_w as u32, rel_h as u32)
+        .map_err(err)?;
+    let (width, height) = (img.width(), img.height());
+    Ok(Screenshot {
+        rgba: img.into_raw(),
+        width,
+        height,
+        origin: (x, y),
+        scale: screens[i].scale,
+        is_primary: false,
+    })
+}
+
+/// Win：SendInput 合成滚轮（事件落在指针当前所在的窗口）。clicks > 0 向上，
+/// < 0 向下，与 Linux 的 XTest M4/M5 语义一致。
+#[cfg(windows)]
+pub fn scroll_wheel(clicks: i32) -> Result<()> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    };
+    /// 滚轮一格的标准增量（Win32 约定 WHEEL_DELTA = 120）
+    const WHEEL_DELTA: u32 = 120;
+
+    for _ in 0..clicks.unsigned_abs() {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx: 0,
+                    dy: 0,
+                    // 正增量向上、负增量向下
+                    mouseData: if clicks > 0 {
+                        WHEEL_DELTA
+                    } else {
+                        WHEEL_DELTA.wrapping_neg()
+                    },
+                    dwFlags: MOUSEEVENTF_WHEEL,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let sent = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+        if sent != 1 {
+            // SendInput 被 UIPI 拦截（目标窗口以管理员运行）时返回 0
+            return Err(CaptureError(
+                "SendInput 注入滚轮失败（目标窗口可能以管理员权限运行）".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// mac：CGEvent 合成滚轮（**像素单位**）。指针需已在目标窗口上（滚动
+/// 截图流程先 warp 到选区中心）。
+///
+/// 真机点验修正（2026-09-19）×3：
+/// 1. 曾误写成每事件带 `clicks×3` 全量行增量再发 N 次（一步实际滚
+///    N²×3 行，过度滚动）
+/// 2. 「自然滚动」开启（macOS 默认）时会话层注入的增量被系统再翻转
+///    （负增量实际向**上**滚）——按 com.apple.swipescrolldirection 偏好
+///    预翻转符号
+/// 3. line 单位不可用：浏览器对「行」的解释在 Retina 下可达 40+ 逻辑
+///    像素/行，每步（2 notch）位移 240-300 物理px，远超拼接器尾部块
+///    匹配窗口（≤96px），内容整窗滚飞 → 拼接全程 NoChange。改像素
+///    单位精确控位：每 notch 15 逻辑像素（≈30 物理），clicks=2 时每步
+///    60 物理px——对齐 X11 notch 的位移量级，尾窗留 36px 重叠可匹配
+#[cfg(target_os = "macos")]
+pub fn scroll_wheel(clicks: i32) -> Result<()> {
+    /// 一格滚轮的位移（逻辑像素；kCGScrollEventUnitPixel 单位）
+    const PX_PER_NOTCH: i32 = 15;
+    let source = unsafe { mac::CGEventSourceCreate(mac::SOURCE_HID) };
+    if source.is_null() {
+        return Err(CaptureError("CGEventSourceCreate 失败".into()));
+    }
+    let mut sign: i32 = clicks.signum();
+    if mac::natural_scrolling_on() {
+        sign = -sign;
+    }
+    let notch = sign * PX_PER_NOTCH;
+    let mut ok = true;
+    for _ in 0..clicks.unsigned_abs() {
+        // kCGScrollEventUnitPixel = 0
+        let ev = unsafe { mac::CGEventCreateScrollWheelEvent(source, 0, 1, notch) };
+        if ev.is_null() {
+            ok = false;
+            break;
+        }
+        unsafe {
+            mac::CGEventPost(mac::SESSION_TAP, ev);
+            mac::CFRelease(ev);
+        }
+    }
+    unsafe { mac::CFRelease(source) };
+    if !ok {
+        return Err(CaptureError("CGEventCreateScrollWheelEvent 失败".into()));
+    }
+    Ok(())
+}
+
+/// 其余平台暂未实现
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn scroll_wheel(_clicks: i32) -> Result<()> {
+    Err(CaptureError("当前平台暂不支持滚动截图".into()))
+}
+
+/// Win：把指针移到虚拟桌面坐标（滚轮事件落在指针下的窗口，滚动截图
+/// 依赖先把指针移到选区中心）。
+#[cfg(windows)]
+pub fn warp_pointer(x: i32, y: i32) -> Result<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos;
+    if unsafe { SetCursorPos(x, y) } == 0 {
+        return Err(CaptureError("SetCursorPos 移动指针失败".into()));
+    }
+    Ok(())
+}
+
+/// mac：CGWarpMouseCursorPosition 收 CG 全局逻辑点，物理输入先 ÷ 所在屏
+/// scale 换算（找不到所在屏时退回主屏 scale，单屏 retina 即主场景）。
+#[cfg(target_os = "macos")]
+pub fn warp_pointer(x: i32, y: i32) -> Result<()> {
+    let monitors = Monitor::all().map_err(err)?;
+    let screens = mac::screens(&monitors);
+    let scale = mac::idx_at_physical(&screens, x, y)
+        .and_then(|i| screens.get(i))
+        .or_else(|| screens.first())
+        .map(|s| s.scale as f64)
+        .ok_or_else(|| CaptureError("no monitor found".into()))?;
+    let rc = unsafe {
+        mac::CGWarpMouseCursorPosition(mac::CGPoint {
+            x: x as f64 / scale,
+            y: y as f64 / scale,
+        })
+    };
+    if rc != 0 {
+        return Err(CaptureError(format!(
+            "CGWarpMouseCursorPosition 失败（错误码 {rc}）"
+        )));
+    }
+    Ok(())
+}
+
+/// 其余平台暂未实现
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn warp_pointer(_x: i32, _y: i32) -> Result<()> {
+    Err(CaptureError("当前平台暂不支持指针移动".into()))
+}
+
+// --------------------------------------------- 状态窗摆放（滚动截图）
+
+/// 状态窗不与选区重叠的纯几何摆放：在屏幕逻辑包围盒内按 右→左→下→上
+/// 依次找与选区间隔 10 逻辑px 的空位；选区≈全屏四面都放不下时钳到屏幕
+/// 右上角——滚轮 warp 目标是选区中心、拼接尾块在选区底部，重叠顶部
+/// 对两者影响都最小。返回窗口左上角（全局逻辑坐标，左上原点）。
+fn place_outside(
+    (rx, ry, rw, rh): (f64, f64, f64, f64),
+    (sx, sy, sw, sh): (f64, f64, f64, f64),
+    (win_w, win_h): (f64, f64),
+) -> (f64, f64) {
+    const GAP: f64 = 10.0;
+    let clamp_x = |px: f64| px.clamp(sx, (sx + sw - win_w).max(sx));
+    let clamp_y = |py: f64| py.clamp(sy, (sy + sh - win_h).max(sy));
+    let px = rx + rw + GAP; // 右
+    if px + win_w <= sx + sw {
+        return (px, clamp_y(ry));
+    }
+    let px = rx - GAP - win_w; // 左
+    if px >= sx {
+        return (px, clamp_y(ry));
+    }
+    let py = ry + rh + GAP; // 下
+    if py + win_h <= sy + sh {
+        return (clamp_x(rx), py);
+    }
+    let py = ry - GAP - win_h; // 上
+    if py >= sy {
+        return (clamp_x(rx), py);
+    }
+    (clamp_x(sx + sw - win_w), sy)
+}
+
+/// mac：滚动截图状态窗的建议位置。winit 在 macOS 对未指定位置的窗口
+/// 一律 `center()`（winit 0.30 window_delegate.rs），置顶状态窗恰好落
+/// 在屏幕中心——交互框选的区域中心常在同一点，拼接线程把指针 warp 到
+/// 选区中心后，合成滚轮事件按「指针下最顶层窗口」全部投进状态窗
+/// （egui 不滚动也不透传），内容不动 → 拼接全程 NoChange → 退化为
+/// 普通截图（真机点验 2026-09-19）。返回选区外的全局逻辑坐标
+/// （egui with_position 语义）；找不到选区所在屏返回 None（调用方
+/// 回退默认位置）。
+#[cfg(target_os = "macos")]
+pub fn status_window_origin(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    win_w: f32,
+    win_h: f32,
+) -> Option<(f32, f32)> {
+    let monitors = Monitor::all().ok()?;
+    let screens = mac::screens(&monitors);
+    let s = screens.get(mac::idx_at_physical(&screens, x + w / 2, y + h / 2)?)?;
+    let k = s.scale as f64;
+    let (px, py) = place_outside(
+        (x as f64 / k, y as f64 / k, w as f64 / k, h as f64 / k),
+        (s.x, s.y, s.w, s.h),
+        (win_w as f64, win_h as f64),
+    );
+    Some((px as f32, py as f32))
+}
+
+/// Win：新窗口走系统默认层叠位置（不居中），维持已验证行为不做摆放
+#[cfg(windows)]
+pub fn status_window_origin(
+    _x: i32,
+    _y: i32,
+    _w: i32,
+    _h: i32,
+    _win_w: f32,
+    _win_h: f32,
+) -> Option<(f32, f32)> {
+    None
+}
+
+/// 其余平台（理论上仅剩非 Win/mac 的移植目标）：无此需求
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn status_window_origin(
+    _x: i32,
+    _y: i32,
+    _w: i32,
+    _h: i32,
+    _win_w: f32,
+    _win_h: f32,
+) -> Option<(f32, f32)> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::place_outside;
+
+    const SCREEN: (f64, f64, f64, f64) = (0.0, 0.0, 1440.0, 900.0);
+    const WIN: (f64, f64) = (320.0, 150.0);
+
+    fn overlap(
+        (ax, ay, aw, ah): (f64, f64, f64, f64),
+        (bx, by, bw, bh): (f64, f64, f64, f64),
+    ) -> bool {
+        ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+    }
+
+    /// 修复目标场景：选区中心=屏幕中心（原 bug 中必被居中状态窗盖住）
+    #[test]
+    fn centered_region_goes_right_clear_of_region() {
+        let region = (520.0, 250.0, 400.0, 400.0);
+        let got = place_outside(region, SCREEN, WIN);
+        assert_eq!(got, (930.0, 250.0));
+        assert!(!overlap((got.0, got.1, WIN.0, WIN.1), region));
+    }
+
+    #[test]
+    fn region_flush_right_goes_left() {
+        let region = (1100.0, 200.0, 340.0, 300.0); // 右缘恰为屏宽 1440
+        let got = place_outside(region, SCREEN, WIN);
+        assert!((got.0 - (1100.0 - 10.0 - WIN.0)).abs() < 1e-9);
+        assert!(!overlap((got.0, got.1, WIN.0, WIN.1), region));
+    }
+
+    #[test]
+    fn full_width_region_goes_below() {
+        let region = (0.0, 0.0, 1440.0, 600.0);
+        let got = place_outside(region, SCREEN, WIN);
+        assert!((got.1 - (600.0 + 10.0)).abs() < 1e-9);
+        assert!(!overlap((got.0, got.1, WIN.0, WIN.1), region));
+    }
+
+    #[test]
+    fn near_fullscreen_region_goes_above() {
+        let region = (0.0, 170.0, 1440.0, 720.0); // 上下各剩不足窗高+GAP
+        let got = place_outside(region, SCREEN, WIN);
+        assert!(!overlap((got.0, got.1, WIN.0, WIN.1), region));
+    }
+
+    /// 选区≈全屏：兜底右上角，但绝不能盖住选区中心（warp 目标）
+    #[test]
+    fn fullscreen_region_falls_back_top_right_clear_of_center() {
+        let region = (0.0, 0.0, 1440.0, 900.0);
+        let got = place_outside(region, SCREEN, WIN);
+        assert!((got.0 - (1440.0 - WIN.0)).abs() < 1e-9 && got.1 == 0.0);
+        let center = (720.0, 450.0);
+        assert!(
+            !(got.0 <= center.0
+                && center.0 <= got.0 + WIN.0
+                && got.1 <= center.1
+                && center.1 <= got.1 + WIN.1)
+        );
+    }
+
+    /// 窗口尺寸超过屏幕时也不 panic（clamp 上下界倒置会 panic）
+    #[test]
+    fn tiny_screen_does_not_panic() {
+        let got = place_outside(
+            (0.0, 0.0, 100.0, 100.0),
+            (0.0, 0.0, 200.0, 120.0),
+            (320.0, 150.0),
+        );
+        assert!(got.0.is_finite() && got.1.is_finite());
+    }
+}
+
+pub fn set_window_class(_window_id: u32, _class: &str) -> Result<()> {
+    Err(CaptureError("当前平台无 X11 WM_CLASS 语义".into()))
+}
+
+pub fn set_window_icon(_window_id: u32, _rgba: &[u8], _w: u32, _h: u32) -> Result<()> {
+    Err(CaptureError("当前平台无 X11 窗口图标语义".into()))
+}
+
+pub fn set_fullscreen_span(_window_id: u32) -> Result<()> {
+    Err(CaptureError("当前平台无 X11 跨屏 fullscreen 语义".into()))
+}
+
+// --------------------------------------------- 录制选区边框（M10）
+
+/// macOS 的录制选区边框：NSWindow 四条 2px 细条围在选区**外侧**，RAII。
+/// 关键约束与 Linux/Win 版一致：**边条绝不覆盖选区像素**（采帧抓选区实际
+/// 屏幕像素，选区内装饰都会进成品），贴屏幕边缘时宁可缺侧也不污染成品。
+///
+/// 线程模型：AppKit 只许主线程操作窗口——创建在调用线程（run_record/
+/// run_scroll 都在主线程、且先于 eframe 事件循环）；闪烁线程的改色经
+/// performSelectorOnMainThread 编组回主队列；guard 在主线程 drop 时直接
+/// orderOut 收尾（滚动截图流程，事件循环已停、perform 无人泵），在闪烁
+/// 线程 drop 时 orderOut 入队后放弃所有权——窗口随录制子进程退出销毁。
+#[cfg(target_os = "macos")]
+pub use mac_border::{record_border, RecordBorder};
+
+#[cfg(target_os = "macos")]
+mod mac_border {
+    use super::mac;
+    use super::Monitor;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{msg_send, sel, MainThreadMarker};
+    use objc2_app_kit::{
+        NSApplication, NSBackingStoreType, NSColor, NSWindow, NSWindowCollectionBehavior,
+        NSWindowLevel, NSWindowStyleMask,
+    };
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    /// 初始颜色（红），与 app 闪烁线程的 RED 常量一致：armed 阶段静态红边
+    const INITIAL: u32 = 0xE5_39_35;
+    /// 边条厚度（物理像素；retina 下 1 逻辑点 = 2 物理 px，线条仍清晰）
+    const T: i32 = 2;
+    /// 边条与选区之间的空隙（物理像素）。capture_region 的逻辑坐标取整会把
+    /// 采帧矩形外扩 ≤1 逻辑px（=2 物理 px）：贴着选区的边条会被采进每一帧，
+    /// 滚动拼接时长图上每隔一步就有一条红线（真机 2026-09-19）。空隙须
+    /// 大于该取整误差
+    const G: i32 = 6;
+    /// NSFloatingWindowLevel / kCGFloatingWindowLevel：悬浮在普通窗口之上
+    const FLOATING: NSWindowLevel = 3;
+
+    /// `Retained<NSWindow>` 非 Send，而 guard 会被 move 进闪烁线程：
+    /// 包一层承诺只在主线程触碰（改色/收尾都经主线程编组）
+    struct MainWin(Retained<NSWindow>);
+    unsafe impl Send for MainWin {}
+
+    pub struct RecordBorder {
+        wins: Vec<MainWin>,
+    }
+
+    impl RecordBorder {
+        /// 更新边条颜色（0xRRGGBB）。NSColor 是不可变值对象，后台线程构造
+        /// 安全；`setBackgroundColor:` 必须在主线程执行，交给 perform。
+        pub fn set_color(&self, pixel: u32) {
+            let color = ns_color(pixel);
+            let sel = sel!(setBackgroundColor:);
+            for w in &self.wins {
+                unsafe {
+                    let _: () = msg_send![
+                        &*w.0,
+                        performSelectorOnMainThread: sel,
+                        withObject: Some(&*color),
+                        waitUntilDone: false
+                    ];
+                }
+            }
+        }
+    }
+
+    impl Drop for RecordBorder {
+        fn drop(&mut self) {
+            if MainThreadMarker::new().is_some() {
+                // 主线程（滚动截图流程，事件循环已停）：就地隐藏并释放
+                for w in self.wins.drain(..) {
+                    w.0.orderOut(None);
+                }
+            } else {
+                // 闪烁线程（录制流程的 guard move 进了线程）：orderOut 入队
+                // 主线程；Retained 就地放弃所有权，避免跨线程 dealloc
+                // （录制子进程随即退出，毫秒级窗口由 OS 回收）
+                let sel = sel!(orderOut:);
+                for w in self.wins.drain(..) {
+                    unsafe {
+                        let _: () = msg_send![
+                            &*w.0,
+                            performSelectorOnMainThread: sel,
+                            withObject: Option::<&AnyObject>::None,
+                            waitUntilDone: false
+                        ];
+                    }
+                    std::mem::forget(w.0);
+                }
+            }
+        }
+    }
+
+    fn ns_color(rgb: u32) -> Retained<NSColor> {
+        NSColor::colorWithRed_green_blue_alpha(
+            ((rgb >> 16) & 0xff) as f64 / 255.0,
+            ((rgb >> 8) & 0xff) as f64 / 255.0,
+            (rgb & 0xff) as f64 / 255.0,
+            1.0,
+        )
+    }
+
+    pub fn record_border(x: i32, y: i32, w: u32, h: u32) -> Option<RecordBorder> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        // AppKit 仅主线程；调用方（run_record/run_scroll）都在主线程
+        let mtm = MainThreadMarker::new()?;
+        // NSWindow 前置：显式初始化 NSApplication（eframe 稍后接管同一实例）
+        let _app = NSApplication::sharedApplication(mtm);
+
+        let monitors = Monitor::all().ok()?;
+        let screens = mac::screens(&monitors);
+        // 物理虚拟桌面（各屏逻辑包围盒 × scale 的并集）
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+        for s in &screens {
+            let k = s.scale as f64;
+            min_x = min_x.min(s.x * k);
+            min_y = min_y.min(s.y * k);
+            max_x = max_x.max((s.x + s.w) * k);
+            max_y = max_y.max((s.y + s.h) * k);
+        }
+        // 主屏逻辑高：AppKit 全局坐标 y 自下而上，与 CG（自上而下）相反
+        let primary_lh = monitors
+            .iter()
+            .find(|m| m.is_primary().unwrap_or(false))
+            .or_else(|| monitors.first())
+            .and_then(|m| m.height().ok())
+            .map(|h| h as f64)?;
+
+        let wi = w.min(i32::MAX as u32) as i32;
+        let hi = h.min(i32::MAX as u32) as i32;
+        // 上/下/左/右四条边条的理想矩形（物理像素）。与选区间隔 G、条厚 T：
+        // 上条 [y−G−T, y−G)，下条 [y+h+G, y+h+G+T)，左右条纵向补齐两角
+        let o = T + G;
+        let strips = [
+            (
+                x.saturating_sub(o),
+                y.saturating_sub(o),
+                wi.saturating_add(2 * o),
+                T,
+            ),
+            (
+                x.saturating_sub(o),
+                y.saturating_add(hi + G),
+                wi.saturating_add(2 * o),
+                T,
+            ),
+            (x.saturating_sub(o), y.saturating_sub(G), T, hi + 2 * G),
+            (x.saturating_add(wi + G), y.saturating_sub(G), T, hi + 2 * G),
+        ];
+
+        let mut wins = Vec::new();
+        for (sx, sy, sw, sh) in strips {
+            // 钳到物理虚拟桌面：贴边选区的外扩条可能越界，裁掉越界部分
+            let x0 = (sx as f64).max(min_x);
+            let y0 = (sy as f64).max(min_y);
+            let x1 = (sx.saturating_add(sw) as f64).min(max_x);
+            let y1 = (sy.saturating_add(sh) as f64).min(max_y);
+            if x1 <= x0 || y1 <= y0 {
+                continue; // 该侧贴屏幕边缘，接受缺边
+            }
+            // 物理矩形 → CG 全局逻辑（÷ 所在屏 scale）
+            let Some(s) =
+                mac::idx_at_physical(&screens, x0 as i32, y0 as i32).and_then(|i| screens.get(i))
+            else {
+                continue;
+            };
+            let k = s.scale as f64;
+            let (lx, ly) = (x0 / k, y0 / k);
+            let (lw, lh) = ((x1 - x0) / k, (y1 - y0) / k);
+            // CG 逻辑（y 自上而下）→ AppKit 逻辑（y 自下而上）
+            let rect = NSRect::new(
+                NSPoint::new(lx, primary_lh - (ly + lh)),
+                NSSize::new(lw.max(1.0), lh.max(1.0)),
+            );
+            let win = unsafe {
+                NSWindow::initWithContentRect_styleMask_backing_defer(
+                    mtm.alloc::<NSWindow>(),
+                    rect,
+                    NSWindowStyleMask::Borderless,
+                    NSBackingStoreType::Buffered,
+                    false,
+                )
+            };
+            // 不透明纯色、无阴影、点击穿透、跨空间可见、悬浮置顶、不激活 App
+            win.setOpaque(true);
+            win.setBackgroundColor(Some(&ns_color(INITIAL)));
+            win.setHasShadow(false);
+            win.setIgnoresMouseEvents(true);
+            win.setCollectionBehavior(NSWindowCollectionBehavior::CanJoinAllSpaces);
+            win.setLevel(FLOATING);
+            win.orderFrontRegardless();
+            wins.push(MainWin(win));
+        }
+        (!wins.is_empty()).then_some(RecordBorder { wins })
+    }
+}
+
+/// 其余平台暂无录制边框（仅占位使 API 跨平台可用）
+#[cfg(not(any(windows, target_os = "macos")))]
+pub struct RecordBorder;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+impl RecordBorder {
+    pub fn set_color(&self, _pixel: u32) {}
+}
+
+/// Win 的录制选区边框：4 条 2px 细条围在选区**外侧**，RAII（Drop 即销毁，
+/// 录制结束/出错/进程退出都不留残影）。
+///
+/// 关键约束与 Linux 版一致：**边条绝不覆盖选区像素**——采帧抓的是选区矩形
+/// 的实际屏幕像素，选区内任何装饰都会被录进成品，因此边条画在选区外扩
+/// 2px 的位置，选区贴屏幕边缘时钳到虚拟桌面范围、缺一侧就缺一侧（宁可
+/// 缺边也不污染成品）。
+///
+/// 线程模型：Win32 窗口只能被创建它的线程销毁，而边框 guard 在调用方线程
+/// 创建、却常在闪烁线程 drop——所以窗口的创建/改色/销毁全部收进一个专属
+/// 线程，外界只经 mpsc 通信。`RecordBorder` drop = 关 channel = 归属线程
+/// 销毁窗口后退出，`join` 保证进程退出前绝无残影。
+#[cfg(windows)]
+pub struct RecordBorder {
+    /// 归属线程的邮箱：发 u32 = 改色（0xRRGGBB）；Sender 关闭 = 销毁退出
+    tx: Option<std::sync::mpsc::Sender<u32>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl RecordBorder {
+    /// 更新全部边条颜色（0xRRGGBB，如 0xE53935 红）。上层的闪烁线程定时
+    /// 调用（红/蓝交替）实现"录制中"的视觉提示；归属线程已退出则静默忽略。
+    pub fn set_color(&self, pixel: u32) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(pixel);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RecordBorder {
+    fn drop(&mut self) {
+        // 关闭 channel：归属线程 recv 失败 → 销毁窗口、注销窗口类、退出
+        self.tx.take();
+        if let Some(h) = self.join.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// RGB(0xRRGGBB) → COLORREF(0x00BBGGRR)
+#[cfg(windows)]
+fn to_colorref(rgb: u32) -> u32 {
+    let r = (rgb >> 16) & 0xff;
+    let g = (rgb >> 8) & 0xff;
+    let b = rgb & 0xff;
+    (b << 16) | (g << 8) | r
+}
+
+/// 在选区 (x, y, w, h) 周围显示录制边框。任何失败（选区外无可用空间/
+/// 建窗失败）都返回 None：录制行为不变，仅无边框。
+#[cfg(windows)]
+pub fn record_border(x: i32, y: i32, w: u32, h: u32) -> Option<RecordBorder> {
+    use std::sync::mpsc;
+
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel::<u32>();
+    // 就绪握手：归属线程建好（或建失败）后回报，失败返回 None——与 Linux 版
+    // 「失败即无边框、录制行为不变」的语义一致
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<bool>(1);
+    let join = std::thread::Builder::new()
+        .name("lscreen-record-border".into())
+        .spawn(move || border_thread(rx, ready_tx, x, y, w, h))
+        .ok()?;
+    if ready_rx.recv().unwrap_or(false) {
+        Some(RecordBorder {
+            tx: Some(tx),
+            join: Some(join),
+        })
+    } else {
+        drop(tx);
+        let _ = join.join();
+        None
+    }
+}
+
+/// 边框窗口归属线程的主体：建窗（回报就绪）→ 收消息改色 → channel 关闭后
+/// 销毁窗口退出。所有 Win32 窗口操作都限制在本线程。
+#[cfg(windows)]
+fn border_thread(
+    rx: std::sync::mpsc::Receiver<u32>,
+    ready_tx: std::sync::mpsc::SyncSender<bool>,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use windows_sys::Win32::Foundation::{HMODULE, HWND};
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateSolidBrush, DeleteObject, InvalidateRect, UpdateWindow, HBRUSH,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
+        RegisterClassW, SetClassLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+        UnregisterClassW, GCLP_HBRBACKGROUND, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    };
+
+    /// 初始颜色（红），与 app 闪烁线程的 RED 常量一致：armed 阶段静态红边
+    const INITIAL: u32 = 0xE5_39_35;
+    /// 边条厚度
+    const T: i32 = 2;
+
+    /// 泵掉队列里的消息（含 WM_PAINT）：边条背景由窗口类画刷在默认
+    /// WM_PAINT 里填充，无需自绘
+    fn pump_paint() {
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    let setup = (|| -> Option<(Vec<HWND>, HBRUSH, Vec<u16>, HMODULE)> {
+        let (min_x, min_y, bw, bh) = monitor_bounds().ok()?;
+        let (max_x, max_y) = (
+            min_x.saturating_add(bw.min(i32::MAX as u32) as i32),
+            min_y.saturating_add(bh.min(i32::MAX as u32) as i32),
+        );
+        let wi = w.min(i32::MAX as u32) as i32;
+        let hi = h.min(i32::MAX as u32) as i32;
+        // 上/下/左/右四条边条的理想矩形（选区外扩 T px；u32→i32 先钳再算防溢出）
+        let strips = [
+            (
+                x.saturating_sub(T),
+                y.saturating_sub(T),
+                wi.saturating_add(2 * T),
+                T,
+            ),
+            (
+                x.saturating_sub(T),
+                y.saturating_add(hi),
+                wi.saturating_add(2 * T),
+                T,
+            ),
+            (x.saturating_sub(T), y, T, hi),
+            (x.saturating_add(wi), y, T, hi),
+        ];
+
+        let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        // 每实例一个窗口类（类画刷即边条颜色，多实例不互扰）
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let class_name: Vec<u16> = format!(
+            "lscreen-border-{}-{}\0",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+        .encode_utf16()
+        .collect();
+        let brush = unsafe { CreateSolidBrush(to_colorref(INITIAL)) };
+        if brush.is_null() {
+            return None;
+        }
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(DefWindowProcW),
+            hInstance: hinstance,
+            hbrBackground: brush,
+            lpszClassName: class_name.as_ptr(),
+            ..Default::default()
+        };
+        if unsafe { RegisterClassW(&wc) } == 0 {
+            unsafe { DeleteObject(brush) };
+            return None;
+        }
+        // 工具窗（不进任务栏/alt-tab）+ 置顶 + 点击穿透（不抢鼠标事件）+ 不抢焦点
+        let ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+        let mut wins = Vec::new();
+        for (sx, sy, sw, sh) in strips {
+            // 钳到虚拟桌面：贴边选区的外扩条可能越界，裁掉越界部分
+            let x0 = sx.max(min_x);
+            let y0 = sy.max(min_y);
+            let x1 = sx.saturating_add(sw).min(max_x);
+            let y1 = sy.saturating_add(sh).min(max_y);
+            if x1 <= x0 || y1 <= y0 {
+                continue; // 该侧贴屏幕边缘，接受缺边
+            }
+            let win = unsafe {
+                CreateWindowExW(
+                    ex,
+                    class_name.as_ptr(),
+                    std::ptr::null(),
+                    WS_POPUP,
+                    x0,
+                    y0,
+                    x1 - x0,
+                    y1 - y0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    hinstance,
+                    std::ptr::null(),
+                )
+            };
+            if win.is_null() {
+                break;
+            }
+            unsafe {
+                ShowWindow(win, SW_SHOWNOACTIVATE);
+                // 显式置顶（ShowWindow 后 topmost 偶被同类窗口顶掉，补一刀）
+                SetWindowPos(
+                    win,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            wins.push(win);
+        }
+        if wins.is_empty() {
+            unsafe {
+                DeleteObject(brush);
+                UnregisterClassW(class_name.as_ptr(), hinstance);
+            }
+            return None;
+        }
+        pump_paint(); // 立即画上初始红边
+        Some((wins, brush, class_name, hinstance))
+    })();
+
+    let Some((wins, mut brush, class_name, hinstance)) = setup else {
+        let _ = ready_tx.send(false);
+        return;
+    };
+    let _ = ready_tx.send(true);
+
+    while let Ok(pixel) = rx.recv() {
+        let new = unsafe { CreateSolidBrush(to_colorref(pixel)) };
+        if !new.is_null() {
+            // 类画刷全类共享：改一处四条全变；换下的旧画刷立即删
+            unsafe { SetClassLongPtrW(wins[0], GCLP_HBRBACKGROUND, new as isize) };
+            let old = std::mem::replace(&mut brush, new);
+            unsafe { DeleteObject(old) };
+            for &win in &wins {
+                unsafe {
+                    InvalidateRect(win, std::ptr::null(), 1);
+                    UpdateWindow(win);
+                }
+            }
+        }
+        pump_paint();
+    } // channel 关闭（RecordBorder drop）→ 收尾
+    for &win in &wins {
+        unsafe { DestroyWindow(win) };
+    }
+    unsafe {
+        DeleteObject(brush);
+        UnregisterClassW(class_name.as_ptr(), hinstance);
+    }
+}
+
+/// 其余平台暂无边框（仅占位使 API 跨平台可用）
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn record_border(_x: i32, _y: i32, _w: u32, _h: u32) -> Option<RecordBorder> {
+    None
+}
+
+/// 虚拟桌面（全部显示器并集）的 (x, y, w, h)，物理像素。
+pub fn monitor_bounds() -> Result<(i32, i32, u32, u32)> {
+    let monitors = Monitor::all().map_err(err)?;
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for m in &monitors {
+        let (x, y) = (m.x().map_err(err)?, m.y().map_err(err)?);
+        let (w, h) = (m.width().map_err(err)?, m.height().map_err(err)?);
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x.saturating_add(w.min(i32::MAX as u32) as i32));
+        max_y = max_y.max(y.saturating_add(h.min(i32::MAX as u32) as i32));
+    }
+    if max_x <= min_x || max_y <= min_y {
+        return Err(CaptureError("no monitor found".into()));
+    }
+    Ok((min_x, min_y, (max_x - min_x) as u32, (max_y - min_y) as u32))
+}
+
+/// 主显示器的 (x, y, w, h)，物理像素。无主屏标记时退回第一台（Win/mac 由
+/// xcap 的 `Monitor::is_primary()` 提供；macOS 上主屏恒为内置屏）。
+pub fn primary_monitor_bounds() -> Result<(i32, i32, u32, u32)> {
+    let monitors = Monitor::all().map_err(err)?;
+    let m = monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .or_else(|| monitors.first())
+        .ok_or_else(|| CaptureError("no monitor found".into()))?;
+    Ok((
+        m.x().map_err(err)?,
+        m.y().map_err(err)?,
+        m.width().map_err(err)?,
+        m.height().map_err(err)?,
+    ))
+}
+
+/// 主显示器缩放比（物理/逻辑）。xcap 偶发返回 0/负值，按无效处理。
+pub fn primary_monitor_scale() -> Option<f32> {
+    let monitors = Monitor::all().ok()?;
+    let m = monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .or_else(|| monitors.first())?;
+    let scale = m.scale_factor().ok()?;
+    (scale > 0.0).then_some(scale)
+}
+
+// --------------------------------------------- 原生窗口句柄（M12：不透明度/穿透）
+
+#[cfg(windows)]
+mod win_native {
+    use super::{CaptureError, Result};
+    use windows_sys::Win32::Foundation::HWND;
+
+    /// NativeWindow 的 Windows 实现：直接持有 HWND。
+    #[derive(Clone)]
+    pub struct NativeWindow(HWND);
+
+    impl NativeWindow {
+        pub fn from_raw(h: raw_window_handle::RawWindowHandle) -> Option<Self> {
+            match h {
+                raw_window_handle::RawWindowHandle::Win32(w) => {
+                    Some(NativeWindow(w.hwnd.get() as HWND))
+                }
+                _ => None,
+            }
+        }
+
+        /// 整窗不透明度：先补 WS_EX_LAYERED 扩展样式（分层窗口是
+        /// SetLayeredWindowAttributes 的前置），再设 alpha 分量。
+        pub fn set_opacity(&self, alpha: f32) -> Result<()> {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE,
+                LWA_ALPHA, WS_EX_LAYERED,
+            };
+            unsafe {
+                let style = GetWindowLongPtrW(self.0, GWL_EXSTYLE);
+                if style & WS_EX_LAYERED as isize == 0 {
+                    SetWindowLongPtrW(self.0, GWL_EXSTYLE, style | WS_EX_LAYERED as isize);
+                }
+                let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+                if SetLayeredWindowAttributes(self.0, 0, a, LWA_ALPHA) == 0 {
+                    return Err(CaptureError("SetLayeredWindowAttributes 失败".into()));
+                }
+            }
+            Ok(())
+        }
+
+        /// 本平台点击穿透不支持区域保留：WS_EX_TRANSPARENT 是整窗命中
+        /// 测试语义，无逐区原语（见 set_click_through）。
+        pub fn input_region_supported() -> bool {
+            false
+        }
+
+        /// 点击穿透：WS_EX_TRANSPARENT 让命中测试穿透本窗口（需配合
+        /// WS_EX_LAYERED）。EXSTYLE 变更后要 SetWindowPos(SWP_FRAMECHANGED)
+        /// 重算框架才对输入生效；关闭穿透只摘 WS_EX_TRANSPARENT，
+        /// 保留 LAYERED（不透明度功能仍在用）。
+        ///
+        /// 整窗语义：`keep`（穿透时保留可交互的区域）在本平台无原语
+        /// 支持，忽略——与 X11 区域穿透不同，开启后本窗口按钮也不可点。
+        pub fn set_click_through(
+            &self,
+            through: bool,
+            keep: Option<(i32, i32, u32, u32)>,
+        ) -> Result<()> {
+            let _ = keep;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_FRAMECHANGED,
+                SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_LAYERED,
+                WS_EX_TRANSPARENT,
+            };
+            unsafe {
+                let style = GetWindowLongPtrW(self.0, GWL_EXSTYLE);
+                let need = if through {
+                    style | (WS_EX_TRANSPARENT | WS_EX_LAYERED) as isize
+                } else {
+                    style & !(WS_EX_TRANSPARENT as isize)
+                };
+                if need != style {
+                    SetWindowLongPtrW(self.0, GWL_EXSTYLE, need);
+                    SetWindowPos(
+                        self.0,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use win_native::NativeWindow;
+
+#[cfg(target_os = "macos")]
+mod mac_native {
+    use super::Result;
+    use objc2::rc::Retained;
+    use objc2_app_kit::NSWindow;
+
+    /// NativeWindow 的 macOS 实现：持有 NSWindow（由 ns_view 反查，retain）。
+    /// NSWindow 非 Send——NativeWindow 只在主线程触碰（eframe App 生命周期
+    /// 本就在主线程，与 mac_border 的 MainWin 同约束）。
+    #[derive(Clone)]
+    pub struct NativeWindow(Retained<NSWindow>);
+
+    impl NativeWindow {
+        pub fn from_raw(h: raw_window_handle::RawWindowHandle) -> Option<Self> {
+            let view = match h {
+                raw_window_handle::RawWindowHandle::AppKit(a) => {
+                    a.ns_view.as_ptr() as *mut objc2::runtime::AnyObject
+                }
+                _ => return None,
+            };
+            // [ns_view window] 返回非持有引用，Retained::retain 补一次 +1
+            let raw: *mut NSWindow = unsafe { objc2::msg_send![view, window] };
+            let win = unsafe { Retained::retain(raw) }?;
+            Some(NativeWindow(win))
+        }
+
+        /// 整窗不透明度：NSWindow alphaValue（1.0 = 不透明）。
+        pub fn set_opacity(&self, alpha: f32) -> Result<()> {
+            self.0.setAlphaValue(alpha.clamp(0.0, 1.0) as f64);
+            Ok(())
+        }
+
+        /// 本平台点击穿透不支持区域保留：setIgnoresMouseEvents 是整窗
+        /// 语义（区域方案需叠加透明子窗口，成本不成比例，不做）。
+        pub fn input_region_supported() -> bool {
+            false
+        }
+
+        /// 点击穿透：让窗口忽略全部鼠标事件（键盘焦点不受影响）。
+        /// 整窗语义：`keep` 忽略（无逐区原语，见 input_region_supported）。
+        pub fn set_click_through(
+            &self,
+            through: bool,
+            keep: Option<(i32, i32, u32, u32)>,
+        ) -> Result<()> {
+            let _ = keep;
+            self.0.setIgnoresMouseEvents(through);
+            Ok(())
+        }
+
+        /// 截图/录屏覆盖层语义，替代原生 fullscreen 建窗：加入所有 Space
+        /// （原生 fullscreen 会独占一个新 Space，入场必播横移切换动画），
+        /// 叠加全屏辅助位（可与他窗共屏、不参与原生全屏切换），并把层级
+        /// 提到菜单栏/Dock 之上——覆盖层才能压住整屏（含菜单栏区域）。
+        /// 配合建窗侧：无边界、逻辑坐标 pos/size 直接贴屏（不走 fullscreen）
+        pub fn set_overlay_behavior(&self) -> Result<()> {
+            use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowLevel};
+            self.0.setCollectionBehavior(
+                NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | NSWindowCollectionBehavior::FullScreenAuxiliary,
+            );
+            // NSPopUpMenuWindowLevel = 101：盖过菜单栏(24)/Dock(20)，低于
+            // 屏保级(1000)——截图覆盖层的常规层级区间
+            const OVERLAY_LEVEL: NSWindowLevel = 101;
+            self.0.setLevel(OVERLAY_LEVEL);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use mac_native::NativeWindow;
+
+#[cfg(not(any(windows, target_os = "macos")))]
+compile_error!("lscreen-capture: 未预期的平台（lib.rs 只分 linux / other 二态）");

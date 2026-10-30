@@ -1,0 +1,100 @@
+import { useEffect, useRef } from 'react';
+import { classifyKeyboardTarget } from '../utils/keyboardTarget';
+
+interface KeyboardOptions {
+  disabled?: boolean;
+  onClose?: () => void;
+  onSearch?: () => void;
+  onDelete?: () => void;
+  onPin?: () => void;
+  onNavigateUp?: () => void;
+  onNavigateDown?: () => void;
+  onPaste?: () => void;
+  onPastePlainText?: () => void;
+  onCopy?: () => void;
+}
+
+export function useKeyboard(options: KeyboardOptions) {
+  const optionsRef = useRef(options);
+
+  useEffect(() => {
+    optionsRef.current = options;
+  }, [options]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (document.documentElement.dataset.captureMode === 'true') return;
+      if (e.isComposing) return;
+
+      const current = optionsRef.current;
+      if (current.disabled) return;
+      const { isInteractive, isSearch } = classifyKeyboardTarget(
+        e.target,
+        '[data-el="search-input"]'
+      );
+      const canNavigateHistory = !isInteractive || isSearch;
+      const isRepeatableAction = e.key === 'ArrowUp' || e.key === 'ArrowDown';
+
+      if (e.repeat && !isRepeatableAction) return;
+
+      if (e.key === 'Escape' && canNavigateHistory && current.onClose) {
+        e.preventDefault();
+        current.onClose();
+        return;
+      }
+
+      if ((e.metaKey || e.ctrlKey) && e.key === 'f' && current.onSearch) {
+        e.preventDefault();
+        current.onSearch();
+        return;
+      }
+
+      if (!isInteractive && e.key === 'Delete' && current.onDelete) {
+        e.preventDefault();
+        current.onDelete();
+        return;
+      }
+
+      // Ctrl+P, not bare "p": every printable key is claimed by type-to-search
+      // (App's focusSearchOnTyping), so a bare-letter binding here would fire
+      // alongside it — typing "password" used to toggle pin state.
+      if (canNavigateHistory && (e.ctrlKey || e.metaKey) && e.key === 'p' && current.onPin) {
+        e.preventDefault();
+        current.onPin();
+        return;
+      }
+
+      if (canNavigateHistory && e.key === 'ArrowUp' && current.onNavigateUp) {
+        e.preventDefault();
+        current.onNavigateUp();
+        return;
+      }
+
+      if (canNavigateHistory && e.key === 'ArrowDown' && current.onNavigateDown) {
+        e.preventDefault();
+        current.onNavigateDown();
+        return;
+      }
+
+      if (canNavigateHistory && e.key === 'Enter' && e.shiftKey && current.onPastePlainText) {
+        e.preventDefault();
+        current.onPastePlainText();
+        return;
+      }
+
+      if (canNavigateHistory && e.key === 'Enter' && (e.ctrlKey || e.metaKey) && current.onCopy) {
+        e.preventDefault();
+        current.onCopy();
+        return;
+      }
+
+      if (canNavigateHistory && e.key === 'Enter' && current.onPaste) {
+        e.preventDefault();
+        current.onPaste();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, []);
+}

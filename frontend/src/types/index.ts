@@ -1,0 +1,99 @@
+export interface ClipboardItem {
+  id: string;
+  clip_type: string;
+  content: string;
+  preview: string;
+  folder_id: string | null;
+  is_pinned: boolean;
+  created_at: string;
+  source_app: string | null;
+  source_icon: string | null;
+  metadata: string | null;
+  has_ocr_text?: boolean;
+  ocr_match: OcrMatch | null;
+  // Matched OCR word boxes to highlight on an image search result (SOU-242
+  // phase 2). Present only for image results whose OCR text matched the query.
+  ocr_highlights?: OcrHighlights | null;
+  // Retention dropped this image's full-resolution blob but kept its thumbnail
+  // and OCR text (SOU-244). It stays searchable; the full image can't be pasted.
+  image_expired?: boolean;
+  // A note the user attached to this clip (SOU-588). Searchable, and shown on
+  // the row so a clip with no memorable text can still be recognized.
+  notes?: string | null;
+  // The user hid this clip's content (SOU-586). When set the row carries no
+  // content or preview at all; revealing it fetches the payload on demand.
+  is_hidden?: boolean;
+}
+
+export interface OcrMatch {
+  before: string;
+  matched: string;
+  after: string;
+}
+
+export interface OcrHighlights {
+  // Image width/height ratio, so the thumbnail can be letterboxed to that shape.
+  aspect: number;
+  // Rectangles as fractions (0..1) of the image dimensions.
+  boxes: OcrRect[];
+}
+
+export interface OcrRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface FolderItem {
+  id: string;
+  name: string;
+  icon: string | null;
+  color: string | null;
+  is_system: boolean;
+  item_count: number;
+}
+
+export interface Settings {
+  capture?: import('../utils/capturePreferences').CapturePreferences;
+  max_items: number;
+  auto_delete_days: number;
+  startup_with_windows: boolean;
+  is_portable?: boolean;
+  startup_available?: boolean;
+  startup_unavailable_reason?: 'portable' | 'app_store' | 'error';
+  self_update_available?: boolean;
+  show_in_taskbar: boolean;
+  hotkey: string;
+  replace_win_v: boolean;
+  theme: string;
+  mica_effect?: string;
+  round_corners?: boolean;
+  float_above_taskbar?: boolean;
+  density?: 'compact' | 'comfortable';
+  ignore_ghost_clips: boolean;
+  skip_sensitive?: boolean;
+  skip_likely_secrets?: boolean;
+  forget_on_clipboard_clear?: boolean;
+  has_completed_onboarding?: boolean;
+  screenshot_hotkey?: string;
+  pin_hotkey?: string;
+}
+
+export type ClipType = 'text' | 'image' | 'html' | 'rtf' | 'url';
+
+export const CLIP_TYPE_LABELS: Record<ClipType, string> = {
+  text: 'Text',
+  image: 'Image',
+  html: 'HTML',
+  rtf: 'Rich Text',
+  url: 'URL',
+};
+
+export const CLIP_TYPE_ICONS: Record<ClipType, string> = {
+  text: 'FileText',
+  image: 'Image',
+  html: 'Code',
+  rtf: 'Type',
+  url: 'Link',
+};

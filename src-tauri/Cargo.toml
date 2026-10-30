@@ -1,0 +1,132 @@
+[package]
+name = "cubby"
+version = "0.2.0"
+description = "A native-feeling clipboard history replacement for Windows 11"
+authors = ["SouthForge AI", "PastePaw contributors"]
+license = "GPL-3.0-only"
+edition = "2021"
+default-run = "cubby"
+# Without this cargo still auto-discovers every src/bin/*.rs as a default
+# target, so the explicit [[bin]] blocks below would gate only the files that
+# happen to be listed there and a newly added one would ship unsigned next to
+# cubby.exe. Adding a diagnostic binary now requires declaring it explicitly.
+autobins = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "chrono", "uuid", "runtime-tokio"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+hmac = "0.12"
+aes-gcm = "0.10"
+# Passphrase -> key for backup bundles (SOU-589). The storage key is DPAPI-bound
+# to one Windows account, so a bundle encrypted with it could never be restored
+# on another machine; Argon2id is the memory-hard KDF for the user-supplied
+# passphrase that replaces it. Same RustCrypto family as aes-gcm/sha2/hmac.
+argon2 = "0.6"
+getrandom = "0.3"
+image = { version = "0.24", default-features = false, features = ["png", "gif"] }
+dirs = "7"
+parking_lot = "0.12"
+tokio = { version = "1", features = ["full"] }
+once_cell = "1"
+base64 = "0.22.1"
+tauri-plugin-autostart = "2"
+tauri-plugin-log = "2.8.0"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+# Default features add zip extraction, which only v1-compatible .zip updates
+# need. Cubby ships plain signed setup.exe updates (createUpdaterArtifacts:
+# true), so leave zip, tar and flate2 out.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
+tauri-plugin-process = "2"
+log = "0.4.29"
+window-vibrancy = { git = "https://github.com/XueshiQiao/window-vibrancy.git" }
+dark-light = "3.0.0"
+tauri-plugin-dialog = "2"
+clipboard-rs = "0.2"
+clipboard-win = { version = "5.4.1", features = ["monitor"] }
+# SBS-983: wipe the derived backup key and in-memory backup JSON on drop so a
+# crash dump or hibernation file does not keep them after export or import.
+# Transitive via aes-gcm/argon2 is not enough — those copies are not ours.
+zeroize = { version = "1.9.0", features = ["derive"] }
+reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "rustls-no-provider", "system-proxy"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+flate2 = "1"
+libloading = "0.8.9"
+# LaterScreen Rust engines used in-process (never as a sidecar/exe).
+lscreen-core = { path = "engines/lscreen-core" }
+lscreen-capture = { path = "engines/lscreen-capture" }
+
+
+[target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = "0.39.1"
+# Match clipboard-rs' decoder and RGBA PNG encoder so moving reads to OLE does
+# not change bitmap pixels, encoded content hashes, or cross-version dedup.
+image_capture = { package = "image", version = "0.25", default-features = false, features = ["bmp", "png"] }
+windows = { version = "0.62.2", features = ["UI_ViewManagement", "Win32_UI_Accessibility", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Globalization", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_LibraryLoader", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_DataExchange", "Win32_UI_Shell", "Win32_Media_MediaFoundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem", "Win32_System_SystemInformation", "Win32_System_Memory", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Ole", "Foundation", "Foundation_Collections", "Media_Ocr", "Graphics_Imaging", "Security_Cryptography", "Storage_Streams"] }
+
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+app-store = []
+# Test-only diagnostic executables. Off by default so `tauri build` never
+# produces them: anything cargo emits into target/release is picked up by the
+# bundler and shipped next to cubby.exe, and an unexplained extra binary in the
+# install directory is both dead weight and a heuristic red flag for Defender.
+# The scripts under scripts/test-*.ps1 enable this feature explicitly.
+dev-harness = []
+
+# The app itself. `autobins = false` turns off discovery of src/main.rs too,
+# so this has to be declared alongside the diagnostic targets below.
+[[bin]]
+name = "cubby"
+path = "src/main.rs"
+
+# Declared explicitly (auto-discovery is off via `autobins = false` above) so
+# each one can be gated behind dev-harness.
+[[bin]]
+name = "clipboard_probe"
+path = "src/bin/clipboard_probe.rs"
+required-features = ["dev-harness"]
+
+[[bin]]
+name = "paste_compat"
+path = "src/bin/paste_compat.rs"
+required-features = ["dev-harness"]
+
+[[bin]]
+name = "compat_matrix"
+path = "src/bin/compat_matrix.rs"
+required-features = ["dev-harness"]
+
+# Note: win_v_helper.rs is also compiled into cubby.exe via `#[path]` in
+# main.rs. This target only builds it as a standalone exe for the test scripts.
+[[bin]]
+name = "win_v_helper"
+path = "src/bin/win_v_helper.rs"
+required-features = ["dev-harness"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+# Keep dependency optimizations, but favor compact code in the desktop shell.
+[profile.release.package.cubby]
+opt-level = "z"
+
+[[bin]]
+name = "capture_probe"
+path = "src/bin/capture_probe.rs"
+required-features = ["dev-harness"]

@@ -1,0 +1,1328 @@
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { WebviewWindow } from '@tauri-apps/api/webviewWindow';
+import { ClipboardItem as AppClipboardItem, FolderItem, Settings } from './types';
+import { ClipList } from './components/ClipList';
+import { ContentFilter, FlyoutHeader } from './components/FlyoutHeader';
+import { ContextMenu } from './components/ContextMenu';
+import { FolderModal } from './components/FolderModal';
+import { ConfirmDialog } from './components/ConfirmDialog';
+import { WelcomeOverlay } from './components/WelcomeOverlay';
+import { useKeyboard } from './hooks/useKeyboard';
+import { useTheme } from './hooks/useTheme';
+import { useSystemAccent } from './hooks/useSystemAccent';
+import { useUpdater } from './hooks/useUpdater';
+import { useRevealedClips } from './hooks/useRevealedClips';
+import { isImeKey, shouldCaptureTypeToSearch } from './utils/flyoutSearch';
+import { folderSelectionAfterReload } from './utils/folderSelection';
+import { clipListPageArgs, nextPageCursor } from './utils/clipListPage';
+import {
+  clipLoadAnnouncesSuccess,
+  clipLoadFailure,
+  type ClipLoadResult,
+  sidecarReloadFailure,
+} from './utils/clipLoadFailure';
+import { Toaster, toast } from 'sonner';
+import { generateDemoClips } from './debug/demoData';
+
+const assetCaptureEnabled = import.meta.env.DEV && import.meta.env.VITE_CUBBY_ASSET_CAPTURE === '1';
+
+// Shown when the user tries to paste/copy the full image of a clip whose
+// full-resolution blob was dropped by retention (SOU-244). Its thumbnail and
+// recognized text remain, so the message points at what is still available.
+const IMAGE_EXPIRED_MESSAGE =
+  "This screenshot's full image expired. Only its recognized text remains.";
+
+// Startup shortcut recovery result (see shortcuts.rs). Fetched once on mount
+// and surfaced as a toast the first time the flyout gains focus.
+interface HotkeyStartupNotice {
+  kind: 'fallback_hotkey' | 'win_v_disabled' | 'failed' | string;
+  requested_hotkey: string;
+  active_hotkey: string | null;
+}
+
+const matchesContentFilter = (clip: AppClipboardItem, filter: ContentFilter) => {
+  if (filter === 'images') return clip.clip_type === 'image';
+  if (filter === 'text') return clip.clip_type === 'text';
+  return true;
+};
+
+function App() {
+  const [clips, setClips] = useState<AppClipboardItem[]>(() =>
+    assetCaptureEnabled ? generateDemoClips().map((clip) => ({ ...clip, ocr_match: null })) : []
+  );
+  const [folders, setFolders] = useState<FolderItem[]>([]);
+  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [contentFilter, setContentFilter] = useState<ContentFilter>('all');
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const [clipListResetToken, setClipListResetToken] = useState(0);
+  const [isLoading, setIsLoading] = useState(!assetCaptureEnabled);
+  const [loadError, setLoadError] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const [theme, setTheme] = useState('system');
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    type: 'card' | 'folder' | 'history';
+    x: number;
+    y: number;
+    itemId: string;
+  } | null>(null);
+  const [clearRequest, setClearRequest] = useState<'unpinned' | 'all' | null>(null);
+  const [isClearing, setIsClearing] = useState(false);
+  const [showWelcome, setShowWelcome] = useState(false);
+
+  // Add Folder Modal State
+  const [showAddFolderModal, setShowAddFolderModal] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+
+  const effectiveTheme = useTheme(theme);
+  useSystemAccent();
+  useUpdater(settings?.self_update_available === true);
+  const hasRoundedCorners = settings?.round_corners ?? true;
+  const density = settings?.density ?? 'comfortable';
+  const windowEffect =
+    settings?.mica_effect === 'clear'
+      ? 'solid'
+      : settings?.mica_effect === 'mica_alt' || settings?.mica_effect === 'auto'
+        ? 'acrylic'
+        : settings?.mica_effect || 'solid';
+  // Solid follows the theme token the same way Settings and History do.
+  // A hardcoded dark fill made light-theme text (near-black) unreadable.
+  const windowSurface =
+    windowEffect === 'solid'
+      ? 'bg-background'
+      : windowEffect === 'acrylic'
+        ? 'bg-background/[0.58]'
+        : 'bg-background/[0.08]';
+  const windowBorder =
+    windowEffect === 'acrylic'
+      ? 'border-white/[0.14]'
+      : windowEffect === 'mica'
+        ? 'border-white/[0.10]'
+        : 'border-border';
+  const windowGeometry = hasRoundedCorners ? 'p-2' : 'p-0';
+  const windowShape = hasRoundedCorners
+    ? 'rounded-[10px] shadow-[0_24px_80px_rgba(0,0,0,0.48),0_6px_24px_rgba(0,0,0,0.32)]'
+    : 'rounded-none shadow-none';
+
+  const { revealed, toggleReveal, forgetRevealed, clearRevealed } = useRevealedClips();
+
+  const appWindow = getCurrentWindow();
+  const selectedFolderRef = useRef(selectedFolder);
+  selectedFolderRef.current = selectedFolder;
+  const loadPerfIdRef = useRef(0);
+  const clipsRef = useRef(clips);
+  clipsRef.current = clips;
+  // Cursor for the next page, captured from the backend's own ordering.
+  // Never read off clipsRef: a pin/unpin re-sorts that array in place.
+  const pageCursorRef = useRef<string | null>(null);
+  // Which query the rows on screen answer. A failed replace only has to wipe
+  // them when this no longer matches the load that failed — a same-filter
+  // refresh (clipboard change, post-edit reload, retry) leaves a correct page.
+  const visibleFilterKeyRef = useRef<string | null>(null);
+  const perfLogEnabled =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
+  useEffect(() => {
+    if (assetCaptureEnabled) {
+      setTheme('dark');
+      setSettings({
+        max_items: 500,
+        auto_delete_days: 0,
+        startup_with_windows: false,
+        show_in_taskbar: false,
+        hotkey: 'Win+V',
+        replace_win_v: true,
+        theme: 'dark',
+        mica_effect: 'clear',
+        round_corners: true,
+        float_above_taskbar: true,
+        density: 'comfortable',
+        ignore_ghost_clips: true,
+        skip_sensitive: true,
+        skip_likely_secrets: false,
+        forget_on_clipboard_clear: true,
+        has_completed_onboarding: true,
+      });
+      return;
+    }
+
+    invoke<Settings>('get_settings')
+      .then((s) => {
+        setTheme(s.theme);
+        setSettings(s);
+        if (!s.has_completed_onboarding) {
+          setShowWelcome(true);
+        }
+      })
+      .catch(console.error);
+
+    // Listen for setting changes from the settings window
+    const unlisten = listen<Settings>('settings-changed', (event) => {
+      setTheme(event.payload.theme);
+      setSettings(event.payload);
+    });
+
+    // Debug only: load demo clips / restore actual data when triggered from settings
+    const unlistenDemo = import.meta.env.DEV
+      ? Promise.all([
+          listen('load-demo-data', () => {
+            setClips(generateDemoClips());
+            setHasMore(false);
+          }),
+          listen('restore-actual-data', () => {
+            loadClips(selectedFolderRef.current, false, '');
+          }),
+        ])
+      : Promise.resolve([() => {}, () => {}]);
+
+    return () => {
+      unlisten.then((f) => f());
+      unlistenDemo.then((fs) => fs.forEach((f) => f()));
+    };
+    // DEV listeners are registered once. Their live folder comes from the ref,
+    // and re-registering them when loadClips changes would duplicate handlers.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Startup shortcut recovery happens before the webview loads, so pull the
+  // notice instead of listening for an event, and hold it until the flyout is
+  // actually visible — a toast fired into a hidden window would expire unseen.
+  const pendingHotkeyNotice = useRef<HotkeyStartupNotice | null>(null);
+  useEffect(() => {
+    if (assetCaptureEnabled) return;
+    invoke<HotkeyStartupNotice | null>('get_hotkey_startup_notice')
+      .then((notice) => {
+        pendingHotkeyNotice.current = notice;
+      })
+      .catch(console.error);
+  }, []);
+
+  const showPendingHotkeyNotice = useCallback(() => {
+    const notice = pendingHotkeyNotice.current;
+    if (!notice) return;
+    pendingHotkeyNotice.current = null;
+    const message =
+      notice.kind === 'fallback_hotkey'
+        ? `${notice.requested_hotkey} 已被其他应用占用。本次会话改用 ${notice.active_hotkey}；你的设置未变。`
+        : notice.kind === 'win_v_disabled'
+          ? `暂时无法接管 Win+V。本次会话请用 ${notice.active_hotkey ?? notice.requested_hotkey} 打开帧匣。`
+          : 'No global hotkey could be registered. Open Cubby from the tray icon and try a different hotkey in Settings.';
+    toast.warning(message, { duration: 10000 });
+  }, []);
+
+  // Clear the search and any active filters whenever the flyout closes, so each
+  // time Cubby opens it starts fresh instead of showing a stale, filtered list.
+  // The window hides on blur, so focus loss is the reliable "closed" signal for
+  // every dismissal path (Esc, click-away, and post-paste hide).
+  useEffect(() => {
+    const unlisten = appWindow.onFocusChanged(async ({ payload: focused }) => {
+      // Private clip reveals still expire on every hide, including capture.
+      if (!focused) clearRevealed();
+      if (document.documentElement.dataset.captureMode === 'true') return;
+      if (await invoke<boolean>('capture_active').catch(() => false)) return;
+      if (focused) {
+        showPendingHotkeyNotice();
+        return;
+      }
+      setSearchQuery('');
+      setContentFilter('all');
+      setSelectedFolder(null);
+      // Reset selection and scroll the list back to the top, so reopening
+      // always shows your most-recent copy instead of wherever you'd scrolled.
+      setSelectedClipId(null);
+      setClipListResetToken((prev) => prev + 1);
+      // Dismiss any transient overlays so reopening lands on the clean list.
+      setContextMenu(null);
+      setClearRequest(null);
+      setShowAddFolderModal(false);
+      setNewFolderName('');
+    });
+    return () => {
+      unlisten.then((dispose) => dispose()).catch(() => undefined);
+    };
+  }, [appWindow, clearRevealed, showPendingHotkeyNotice]);
+
+  const openSettings = useCallback(async () => {
+    // Check if settings window already exists
+    const existingWin = await WebviewWindow.getByLabel('settings');
+    if (existingWin) {
+      try {
+        await invoke('focus_window', { label: 'settings' });
+      } catch (e) {
+        console.error('Failed to focus settings window:', e);
+        // Fallback to JS API if command fails (though command is preferred)
+        await existingWin.unminimize();
+        await existingWin.show();
+        await existingWin.setFocus();
+      }
+      return;
+    }
+
+    const settingsWin = new WebviewWindow('settings', {
+      url: 'index.html?window=settings',
+      title: 'Settings',
+      width: 800,
+      height: 700,
+      resizable: true,
+      decorations: false, // We have our own title bar in SettingsPanel
+      transparent: false,
+      center: true,
+    });
+
+    settingsWin.once('tauri://created', function () {});
+
+    settingsWin.once('tauri://error', function (e) {
+      console.error('Error creating settings window', e);
+    });
+  }, []);
+
+  // Creating and focusing the History window lives in Rust so the flyout and
+  // the tray menu open it exactly the same way.
+  const openHistoryWindow = useCallback(async () => {
+    try {
+      await invoke('open_history_window');
+    } catch (e) {
+      console.error('Failed to open the history window:', e);
+      toast.error('Failed to open the History window');
+    }
+  }, []);
+
+  const handleDismissWelcome = useCallback(() => {
+    setShowWelcome(false);
+    setSettings((prev) => (prev ? { ...prev, has_completed_onboarding: true } : prev));
+    invoke('complete_onboarding').catch(console.error);
+  }, []);
+
+  const loadClips = useCallback(
+    async (
+      folderId: string | null,
+      append: boolean = false,
+      searchQuery: string = '',
+      filter: ContentFilter = 'all'
+    ): Promise<ClipLoadResult> => {
+      const perfId = ++loadPerfIdRef.current;
+      const filterKey = JSON.stringify([folderId, searchQuery.trim(), filter]);
+      const loadStart = perfLogEnabled ? performance.now() : 0;
+      let invokeStart = 0;
+      let invokeEnd = 0;
+
+      try {
+        setIsLoading(true);
+
+        const page = clipListPageArgs(
+          { loadedCount: clipsRef.current.length, cursorId: pageCursorRef.current },
+          append,
+          20
+        );
+        // The index lowercases but does not trim, so a leading space matches
+        // nothing. History already sends the trimmed form.
+        const query = searchQuery.trim();
+
+        let data: AppClipboardItem[];
+
+        if (assetCaptureEnabled) {
+          const demoQuery = query.toLocaleLowerCase();
+          data = generateDemoClips()
+            .filter((clip) => {
+              if (!demoQuery) return true;
+              const searchable = [
+                clip.content,
+                clip.preview,
+                clip.ocr_match?.before,
+                clip.ocr_match?.matched,
+                clip.ocr_match?.after,
+              ]
+                .filter(Boolean)
+                .join(' ')
+                .toLocaleLowerCase();
+              return searchable.includes(demoQuery);
+            })
+            .map((clip) => ({ ...clip, ocr_match: demoQuery ? clip.ocr_match : null }))
+            .filter((clip) => matchesContentFilter(clip, filter));
+          invokeStart = performance.now();
+          invokeEnd = invokeStart;
+        } else if (query) {
+          if (perfLogEnabled) invokeStart = performance.now();
+          data = await invoke<AppClipboardItem[]>('search_clips', {
+            query,
+            filterId: folderId,
+            ...page,
+            previewOnly: true,
+            contentFilter: filter,
+          });
+          if (perfLogEnabled) invokeEnd = performance.now();
+        } else {
+          if (perfLogEnabled) invokeStart = performance.now();
+          data = await invoke<AppClipboardItem[]>('get_clips', {
+            filterId: folderId,
+            ...page,
+            previewOnly: true,
+            contentFilter: filter,
+          });
+          if (perfLogEnabled) invokeEnd = performance.now();
+        }
+
+        const imageCount = perfLogEnabled
+          ? data.filter((item) => item.clip_type === 'image').length
+          : 0;
+        const totalContentChars = perfLogEnabled
+          ? data.reduce((sum, item) => sum + (item.content?.length ?? 0), 0)
+          : 0;
+        const imageContentChars = perfLogEnabled
+          ? data
+              .filter((item) => item.clip_type === 'image')
+              .reduce((sum, item) => sum + (item.content?.length ?? 0), 0)
+          : 0;
+
+        // A newer load supersedes this one (e.g. the reset when the flyout
+        // closes starts an unfiltered load while a filtered one is in flight).
+        // Discard the stale result so it can't overwrite the current view.
+        if (perfId !== loadPerfIdRef.current) return 'superseded';
+
+        if (append) {
+          setClips((prev) => {
+            return [...prev, ...data];
+          });
+        } else {
+          setClips(data);
+        }
+        pageCursorRef.current = nextPageCursor(data, append ? pageCursorRef.current : null);
+        visibleFilterKeyRef.current = filterKey;
+
+        // If we got fewer than limit, no more clips
+        setHasMore(data.length === 20);
+
+        if (perfLogEnabled) {
+          const stateQueuedAt = performance.now();
+          requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+              const paintedAt = performance.now();
+              console.info('[perf][loadClips]', {
+                id: perfId,
+                folderId: folderId ?? 'all',
+                append,
+                hasSearch: Boolean(searchQuery.trim()),
+                offset: page.offset,
+                itemCount: data.length,
+                imageCount,
+                totalContentChars,
+                imageContentChars,
+                invokeMs: Number((invokeEnd - invokeStart).toFixed(1)),
+                queueToPaintMs: Number((paintedAt - stateQueuedAt).toFixed(1)),
+                totalMs: Number((paintedAt - loadStart).toFixed(1)),
+              });
+            });
+          });
+        }
+        setLoadError(false);
+        return 'applied';
+      } catch (error) {
+        // Superseded is unknown, not success: a caller that toasts "deleted"
+        // from this return would announce work the newer load has not applied.
+        if (perfId !== loadPerfIdRef.current) return 'superseded';
+        console.error('Failed to load clips:', error);
+        setHasMore(false);
+        const failure = clipLoadFailure({
+          append,
+          visibleRowsStillApply: visibleFilterKeyRef.current === filterKey,
+          hasVisibleClips: clipsRef.current.length > 0,
+        });
+        if (failure.clearList) {
+          setClips([]);
+          pageCursorRef.current = null;
+          // The empty list now stands for this query, so retrying it is a
+          // same-filter refresh rather than another filter change.
+          visibleFilterKeyRef.current = filterKey;
+        }
+        // Banner (same-filter replace) and panel (empty list) both read
+        // loadError. Pagination keeps the first page healthy, so it toasts
+        // instead of marking the list stale.
+        if (!append) {
+          setLoadError(true);
+        }
+        if (failure.notify) {
+          toast.error(append ? 'Couldn’t load more clips' : 'Couldn’t refresh clipboard history', {
+            // One id, so a backend that keeps failing on every clipboard change
+            // replaces its own message instead of stacking a wall of them.
+            id: 'clip-load-failed',
+          });
+        }
+        return 'failed';
+      } finally {
+        if (perfId === loadPerfIdRef.current) setIsLoading(false);
+      }
+    },
+    [perfLogEnabled]
+  );
+
+  const loadFolders = useCallback(async () => {
+    if (assetCaptureEnabled) {
+      setFolders([]);
+      return true;
+    }
+    try {
+      const data = await invoke<FolderItem[]>('get_folders');
+
+      setFolders(data);
+      const next = folderSelectionAfterReload(selectedFolderRef.current, data);
+      if (next !== selectedFolderRef.current) {
+        selectedFolderRef.current = next;
+        setSelectedFolder(next);
+      }
+      return true;
+    } catch (error) {
+      console.error('Failed to load folders:', error);
+      // Last-known-good folders stay; unknown is not an empty folder list.
+      const failure = sidecarReloadFailure();
+      if (failure.notify) {
+        toast.error('Couldn’t refresh folders', { id: 'folder-load-failed' });
+      }
+      return false;
+    }
+  }, []);
+
+  const refreshCurrentFolder = useCallback(
+    () => loadClips(selectedFolderRef.current, false, searchQuery, contentFilter),
+    [loadClips, searchQuery, contentFilter]
+  );
+
+  const handleSearch = useCallback((query: string) => {
+    setSearchQuery(query);
+  }, []);
+
+  const handleSelectFolder = useCallback((folderId: string | null) => {
+    // Reset view-level selection state whenever user switches/re-clicks folders.
+    setSelectedClipId(null);
+    setClipListResetToken((prev) => prev + 1);
+    setSelectedFolder(folderId);
+  }, []);
+
+  useEffect(() => {
+    loadFolders();
+    loadClips(selectedFolder, false, searchQuery.trim() ? searchQuery : '', contentFilter);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFolder, searchQuery, contentFilter]);
+
+  // Total History Count
+  const [totalClipCount, setTotalClipCount] = useState(0);
+
+  const refreshTotalCount = useCallback(async () => {
+    if (assetCaptureEnabled) {
+      setTotalClipCount(generateDemoClips().length);
+      return true;
+    }
+    try {
+      const count = await invoke<number>('get_clipboard_history_size');
+      setTotalClipCount(count);
+      return true;
+    } catch (e) {
+      console.error('Failed to get history size', e);
+      const failure = sidecarReloadFailure();
+      if (failure.notify) {
+        toast.error('Couldn’t refresh the clip count', { id: 'history-count-load-failed' });
+      }
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshTotalCount();
+  }, [refreshTotalCount]);
+
+  useEffect(() => {
+    if (!assetCaptureEnabled) return;
+
+    const query = 'clipboard service unavailable';
+    const timers: number[] = [];
+    let typingTimer: number | null = null;
+
+    const runSearch = () => {
+      setSearchQuery('');
+      const input = document.querySelector<HTMLInputElement>('[data-el="search-input"]');
+      input?.focus();
+      let index = 0;
+      typingTimer = window.setInterval(() => {
+        index += 1;
+        setSearchQuery(query.slice(0, index));
+        if (index >= query.length && typingTimer !== null) {
+          window.clearInterval(typingTimer);
+          typingTimer = null;
+          timers.push(window.setTimeout(runSearch, 2800));
+        }
+      }, 72);
+    };
+
+    timers.push(window.setTimeout(runSearch, 1800));
+
+    return () => {
+      timers.forEach(window.clearTimeout);
+      if (typingTimer !== null) window.clearInterval(typingTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlistenClipboard = listen('clipboard-change', () => {
+      void (async () => {
+        const previous = selectedFolderRef.current;
+        await loadFolders();
+        // A deleted folder is reset to All inside loadFolders. That change
+        // reloads the unfiltered list; do not refetch the gone folder first.
+        if (selectedFolderRef.current === previous) {
+          refreshCurrentFolder();
+        }
+        refreshTotalCount();
+      })();
+    });
+
+    // When a screenshot finishes OCR in the background, surface its "paste text"
+    // affordance on the already-visible card instead of only after a reload.
+    const unlistenOcr = listen<string>('ocr-completed', (event) => {
+      const clipId = event.payload;
+      setClips((prev) =>
+        prev.map((clip) => (clip.id === clipId ? { ...clip, has_ocr_text: true } : clip))
+      );
+    });
+
+    return () => {
+      unlistenClipboard.then((unlisten) => {
+        if (typeof unlisten === 'function') unlisten();
+      });
+      unlistenOcr.then((unlisten) => {
+        if (typeof unlisten === 'function') unlisten();
+      });
+    };
+  }, [refreshCurrentFolder, loadFolders, refreshTotalCount]);
+
+  const handleDelete = async (clipId: string | null) => {
+    if (!clipId) return;
+    const deletedIndex = visibleClips.findIndex((clip) => clip.id === clipId);
+    const remainingVisibleClips = visibleClips.filter((clip) => clip.id !== clipId);
+    const nextSelection =
+      deletedIndex < 0
+        ? (remainingVisibleClips[0]?.id ?? null)
+        : (remainingVisibleClips[Math.min(deletedIndex, remainingVisibleClips.length - 1)]?.id ??
+          null);
+    try {
+      // Cubby has no trash/recovery surface. Delete must therefore remove the
+      // persisted payload immediately instead of leaving a hidden soft-delete.
+      await invoke('delete_clip', { id: clipId, hardDelete: true });
+      forgetRevealed(clipId);
+      setClips((currentClips) => currentClips.filter((clip) => clip.id !== clipId));
+      setSelectedClipId(nextSelection);
+      // Refresh counts
+      loadFolders();
+      refreshTotalCount();
+      toast.success('Clip deleted');
+    } catch (error) {
+      console.error('Failed to delete clip:', error);
+      toast.error('Failed to delete clip');
+    }
+  };
+
+  const handlePaste = useCallback(
+    async (clipId: string, plainText: boolean = false) => {
+      try {
+        const clip = clips.find((c) => c.id === clipId);
+        if (!clip) return;
+        if (plainText && clip.clip_type === 'image') return;
+        // The full-resolution image is gone (dropped by retention); its OCR text
+        // is still one keystroke away via "paste recognized text". Don't hand
+        // back the low-res thumbnail as if it were the original.
+        if (clip.clip_type === 'image' && clip.image_expired) {
+          toast.error(IMAGE_EXPIRED_MESSAGE);
+          return;
+        }
+
+        await invoke('paste_clip', { id: clipId, plainText });
+      } catch (error) {
+        console.error('Failed to paste clip:', error);
+        toast.error(`粘贴记录失败：${String(error)}`);
+      }
+    },
+    [clips]
+  );
+
+  const handleCopy = useCallback(
+    async (clipId: string, plainText: boolean = false) => {
+      try {
+        const clip = clips.find((c) => c.id === clipId);
+        if (!clip) return;
+        if (plainText && clip.clip_type === 'image') return;
+        if (clip.clip_type === 'image' && clip.image_expired) {
+          toast.error(IMAGE_EXPIRED_MESSAGE);
+          return;
+        }
+
+        await invoke('copy_clip', { id: clipId, plainText });
+
+        toast.success('Copied to clipboard');
+      } catch (error) {
+        console.error('Failed to copy clip:', error);
+        toast.error('Failed to copy');
+      }
+    },
+    [clips]
+  );
+
+  const handlePasteOcrText = useCallback(async (clipId: string) => {
+    try {
+      await invoke('paste_ocr_text', { id: clipId });
+    } catch (error) {
+      console.error('Failed to paste recognized text:', error);
+      toast.error('Failed to paste recognized text');
+    }
+  }, []);
+
+  const handleCopyOcrText = useCallback(async (clipId: string) => {
+    try {
+      await invoke('copy_ocr_text', { id: clipId });
+      toast.success('Copied to clipboard');
+    } catch (error) {
+      console.error('Failed to copy recognized text:', error);
+      toast.error('Failed to copy');
+    }
+  }, []);
+
+  // Persist the hidden flag. Distinct from revealing for the session: this is
+  // the state that survives a restart.
+  const handleToggleHidden = useCallback(
+    async (clipId: string) => {
+      try {
+        const hidden = await invoke<boolean>('toggle_clip_hidden', { id: clipId });
+        forgetRevealed(clipId);
+        if (hidden) {
+          // Drop the payload from React state immediately. Clearing `content`
+          // but leaving `preview` would keep the secret text in the renderer
+          // until the reload landed, which is the whole thing being prevented.
+          setClips((current) =>
+            current.map((clip) =>
+              clip.id === clipId
+                ? { ...clip, is_hidden: true, content: '', preview: '', notes: null }
+                : clip
+            )
+          );
+        }
+        // Unhiding has nothing to restore optimistically — the row's payload was
+        // withheld by the backend, so only a reload can put it back. Marking it
+        // visible early would just render an empty row, and leave it empty for
+        // good if the reload failed.
+        // Awaited, and the result checked: unhiding only puts the payload back
+        // when the reload lands, so reporting success before then can leave a
+        // row blank under a toast saying it is visible again. loadClips reports
+        // failure rather than throwing, so the toast has to read its result.
+        // Same-filter reload: a failure shows the stale banner over the rows.
+        // A toast here would be a second channel for one failed reload, and a
+        // superseded reload belongs to the newer load that owns the view.
+        if (!clipLoadAnnouncesSuccess(await refreshCurrentFolder())) return;
+        toast.success(hidden ? 'Clip hidden' : 'Clip no longer hidden');
+      } catch (error) {
+        console.error('Failed to change clip visibility:', error);
+        toast.error('Failed to change clip visibility');
+      }
+    },
+    [forgetRevealed, refreshCurrentFolder]
+  );
+
+  const handleTogglePin = useCallback(
+    async (clipId: string | null) => {
+      if (!clipId) return;
+      try {
+        const isPinned = await invoke<boolean>('toggle_clip_pin', { id: clipId });
+        setClips((currentClips) =>
+          currentClips
+            .map((clip) => (clip.id === clipId ? { ...clip, is_pinned: isPinned } : clip))
+            .sort(
+              (left, right) =>
+                Number(right.is_pinned) - Number(left.is_pinned) ||
+                new Date(right.created_at).getTime() - new Date(left.created_at).getTime()
+            )
+        );
+        toast.success(isPinned ? 'Clip pinned' : 'Clip unpinned');
+      } catch (error) {
+        console.error('Failed to update pin state:', error);
+        toast.error('Failed to update pin state');
+      }
+    },
+    [setClips]
+  );
+
+  // Content tabs are filtered by the backend query (paging stays correct that
+  // way), so every loaded clip is visible.
+  const visibleClips = clips;
+
+  const emptyState = useMemo(() => {
+    if (searchQuery.trim()) {
+      return {
+        title: 'No matching clips',
+        description: 'Try a different search or clear the current filters.',
+      };
+    }
+    if (selectedFolder) {
+      return {
+        title: 'This folder is empty',
+        description: 'Move a clip here or choose another folder.',
+      };
+    }
+    if (contentFilter === 'images') {
+      return {
+        title: 'No images in this view',
+        description: 'Copy an image or switch back to All.',
+      };
+    }
+    if (contentFilter === 'text') {
+      return {
+        title: 'No text in this view',
+        description: 'Copy some text or switch back to All.',
+      };
+    }
+    return {
+      title: 'No clips yet',
+      description: 'Copy something to your clipboard and it will appear here.',
+    };
+  }, [contentFilter, searchQuery, selectedFolder]);
+
+  useEffect(() => {
+    if (visibleClips.length === 0) {
+      setSelectedClipId(null);
+      return;
+    }
+    if (!selectedClipId || !visibleClips.some((clip) => clip.id === selectedClipId)) {
+      setSelectedClipId(visibleClips[0].id);
+    }
+  }, [visibleClips, selectedClipId]);
+
+  useEffect(() => {
+    const focusSearchOnTyping = (event: KeyboardEvent) => {
+      if (document.documentElement.dataset.captureMode === 'true') return;
+      if (contextMenu || clearRequest || showAddFolderModal || showWelcome) return;
+      const target = event.target as HTMLElement | null;
+      const isEditing =
+        target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA' || target?.isContentEditable;
+      if (isEditing) return;
+
+      const input = document.querySelector<HTMLInputElement>('[data-el="search-input"]');
+      if (!input) return;
+
+      // IME: focus the box and let composition start there. preventDefault plus
+      // appending event.key as Latin stops WebView2 composition (ja/zh).
+      if (isImeKey(event)) {
+        input.focus();
+        return;
+      }
+
+      if (!shouldCaptureTypeToSearch(event)) return;
+
+      event.preventDefault();
+      input.focus();
+      setSearchQuery((query) => `${query}${event.key}`);
+    };
+
+    document.addEventListener('keydown', focusSearchOnTyping);
+    return () => document.removeEventListener('keydown', focusSearchOnTyping);
+  }, [clearRequest, contextMenu, showAddFolderModal, showWelcome]);
+
+  const handleNavigateUp = useCallback(() => {
+    if (visibleClips.length === 0) return;
+
+    if (!selectedClipId) {
+      setSelectedClipId(visibleClips[0].id);
+      return;
+    }
+
+    const currentIndex = visibleClips.findIndex((c) => c.id === selectedClipId);
+    if (currentIndex > 0) {
+      setSelectedClipId(visibleClips[currentIndex - 1].id);
+    }
+  }, [visibleClips, selectedClipId]);
+
+  const handleNavigateDown = useCallback(() => {
+    if (visibleClips.length === 0) return;
+
+    if (!selectedClipId) {
+      setSelectedClipId(visibleClips[0].id);
+      return;
+    }
+
+    const currentIndex = visibleClips.findIndex((c) => c.id === selectedClipId);
+    if (currentIndex < visibleClips.length - 1) {
+      setSelectedClipId(visibleClips[currentIndex + 1].id);
+    }
+  }, [visibleClips, selectedClipId]);
+
+  const handlePasteSelected = useCallback(() => {
+    if (selectedClipId) {
+      handlePaste(selectedClipId);
+    }
+  }, [selectedClipId, handlePaste]);
+
+  const handlePasteSelectedAsPlainText = useCallback(() => {
+    if (!selectedClipId) return;
+    const selectedClip = visibleClips.find((clip) => clip.id === selectedClipId);
+    if (!selectedClip) return;
+    if (selectedClip.clip_type === 'image') {
+      if (selectedClip.has_ocr_text) handlePasteOcrText(selectedClipId);
+      return;
+    }
+    handlePaste(selectedClipId, true);
+  }, [selectedClipId, visibleClips, handlePaste, handlePasteOcrText]);
+
+  const handleCopySelected = useCallback(() => {
+    if (selectedClipId) {
+      handleCopy(selectedClipId);
+    }
+  }, [selectedClipId, handleCopy]);
+
+  useKeyboard({
+    disabled: Boolean(contextMenu || clearRequest || showAddFolderModal || showWelcome),
+    onClose: () => {
+      if (searchQuery) {
+        setSearchQuery('');
+        document.querySelector<HTMLInputElement>('[data-el="search-input"]')?.focus();
+        return;
+      }
+      appWindow.hide();
+    },
+    onSearch: () => document.querySelector<HTMLInputElement>('[data-el="search-input"]')?.focus(),
+    onDelete: () => handleDelete(selectedClipId),
+    onPin: () => handleTogglePin(selectedClipId),
+    onNavigateUp: handleNavigateUp,
+    onNavigateDown: handleNavigateDown,
+    onPaste: handlePasteSelected,
+    onPastePlainText: handlePasteSelectedAsPlainText,
+    onCopy: handleCopySelected,
+  });
+
+  /**
+   * `created` is about the folder, `reloaded` about the sidebar. They differ:
+   * the folder exists even when `get_folders` then fails, and loadFolders has
+   * already toasted that failure. The caller uses `reloaded` only to decide
+   * whether to stack a success toast on top of that error.
+   */
+  const handleCreateFolder = async (name: string) => {
+    try {
+      await invoke('create_folder', { name, icon: null, color: null });
+      return { created: true, reloaded: await loadFolders() };
+    } catch (error) {
+      console.error('Failed to create folder:', error);
+      toast.error('Failed to create folder');
+      return { created: false, reloaded: false };
+    }
+  };
+
+  const handleMoveClip = async (clipId: string, folderId: string | null) => {
+    try {
+      await invoke('move_to_folder', { clipId, folderId });
+
+      if (selectedFolder && folderId !== selectedFolder) {
+        setClips((current) => current.filter((clip) => clip.id !== clipId));
+        setSelectedClipId(null);
+      } else {
+        setClips((current) =>
+          current.map((clip) => (clip.id === clipId ? { ...clip, folder_id: folderId } : clip))
+        );
+      }
+
+      // A failed folder reload already toasted. One message per failure.
+      if (await loadFolders()) {
+        toast.success(
+          folderId
+            ? `已移至 ${folders.find((folder) => folder.id === folderId)?.name ?? '文件夹'}`
+            : 'Removed from folder'
+        );
+      }
+    } catch (error) {
+      console.error('Failed to move clip:', error);
+      toast.error('Failed to move clip');
+    }
+  };
+
+  const loadMore = useCallback(() => {
+    if (hasMore && !isLoading) {
+      loadClips(selectedFolder, true, searchQuery, contentFilter);
+    }
+  }, [hasMore, isLoading, selectedFolder, loadClips, searchQuery, contentFilter]);
+
+  // New Folder Modal Rename Mode
+  const [folderModalMode, setFolderModalMode] = useState<'create' | 'rename'>('create');
+  const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
+
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent, type: 'card' | 'folder', itemId: string) => {
+      e.preventDefault();
+      setContextMenu({
+        type,
+        x: e.clientX,
+        y: e.clientY,
+        itemId,
+      });
+    },
+    []
+  );
+
+  const handleHistoryMenu = useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    setContextMenu({
+      type: 'history',
+      x: rect.right,
+      y: rect.bottom + 4,
+      itemId: '',
+    });
+  }, []);
+
+  const handleCloseContextMenu = useCallback(() => {
+    setContextMenu(null);
+  }, []);
+
+  // Updated Create Folder to handle Rename
+  const handleCreateOrRenameFolder = async (name: string) => {
+    if (folderModalMode === 'create') {
+      const { created, reloaded } = await handleCreateFolder(name);
+      if (!created) return;
+      // The folder exists, so the modal closes either way. Resubmitting the
+      // same name would only fail as a duplicate. loadFolders already said the
+      // sidebar is stale, so do not add a success toast next to that error.
+      if (reloaded) toast.success(`已创建文件夹"${name}"`);
+      setShowAddFolderModal(false);
+      setNewFolderName('');
+    } else if (folderModalMode === 'rename' && editingFolderId) {
+      try {
+        await invoke('rename_folder', { id: editingFolderId, name });
+        if (await loadFolders()) toast.success(`已重命名为"${name}"`);
+        setShowAddFolderModal(false);
+        setNewFolderName('');
+      } catch (error) {
+        console.error('Failed to rename folder:', error);
+        toast.error('Failed to rename folder');
+      }
+    }
+  };
+
+  const handleDeleteFolder = async (folderId: string) => {
+    if (!folderId) return;
+    try {
+      await invoke('delete_folder', { id: folderId });
+      if (selectedFolder === folderId) {
+        setSelectedFolder(null);
+      }
+      // delete_folder also emits clipboard-change, and that listener runs its
+      // own loadFolders. Both reloads share the folder-load-failed toast id, so
+      // a failure here is already on screen exactly once; adding a second
+      // message would stack two errors for one refresh.
+      const foldersReloaded = await loadFolders();
+      await refreshTotalCount();
+      if (!foldersReloaded) return;
+      toast.success('Folder deleted');
+    } catch (error) {
+      console.error('Failed to delete folder:', error);
+      toast.error('Failed to delete folder');
+    }
+  };
+
+  const handleClearClips = async (mode: 'unpinned' | 'all') => {
+    if (isClearing) return;
+    setIsClearing(true);
+    try {
+      const deleted =
+        mode === 'unpinned'
+          ? await invoke<number>('clear_unpinned_clips')
+          : (await invoke('clear_all_clips'), totalClipCount);
+
+      setSelectedClipId(null);
+      setClipListResetToken((token) => token + 1);
+      // Clear-all deletes every visible row. Clear-unpinned leaves pinned
+      // clips, so a failed reload must keep those rather than wiping them.
+      if (mode === 'all') {
+        visibleFilterKeyRef.current = null;
+      }
+      const [reloaded] = await Promise.all([
+        loadClips(selectedFolder, false, searchQuery, contentFilter),
+        loadFolders(),
+        refreshTotalCount(),
+      ]);
+      if (!clipLoadAnnouncesSuccess(reloaded)) {
+        return;
+      }
+      clearRevealed();
+      toast.success(
+        mode === 'unpinned'
+          ? deleted === 1
+            ? `已清除 ${deleted} 条未置顶记录`
+            : `已清除 ${deleted} 条未置顶记录`
+          : 'Clipboard history cleared'
+      );
+      setClearRequest(null);
+    } catch (error) {
+      console.error('Failed to clear clipboard history:', error);
+      toast.error('Failed to clear clipboard history');
+    } finally {
+      setIsClearing(false);
+    }
+  };
+
+  return (
+    <div
+      data-el="app-root"
+      className={`relative h-screen w-full overflow-hidden bg-transparent ${windowGeometry}`}
+    >
+      <div
+        data-el="app-window"
+        className={`relative h-full w-full overflow-hidden border ${windowBorder} ${windowShape} ${windowSurface}`}
+      >
+        <div data-el="app-frame" className="flex h-full w-full flex-col font-sans text-foreground">
+          {showWelcome && settings && <WelcomeOverlay onDismiss={handleDismissWelcome} />}
+
+          {contextMenu && (
+            <ContextMenu
+              x={contextMenu.x}
+              y={contextMenu.y}
+              kind={contextMenu.type}
+              onClose={handleCloseContextMenu}
+              options={
+                contextMenu.type === 'history'
+                  ? [
+                      {
+                        label: 'Clear unpinned items…',
+                        disabled: totalClipCount === 0,
+                        onClick: () => setClearRequest('unpinned'),
+                      },
+                      {
+                        label: 'Clear everything…',
+                        danger: true,
+                        disabled: totalClipCount === 0,
+                        onClick: () => setClearRequest('all'),
+                      },
+                    ]
+                  : contextMenu.type === 'card'
+                    ? (() => {
+                        const clip = clips.find((item) => item.id === contextMenu.itemId);
+                        return [
+                          {
+                            label: clip?.is_pinned ? 'Unpin' : 'Pin',
+                            onClick: () => handleTogglePin(contextMenu.itemId),
+                          },
+                          {
+                            label: clip?.is_hidden ? 'Unhide content' : 'Hide content',
+                            onClick: () => handleToggleHidden(contextMenu.itemId),
+                          },
+                          {
+                            label: 'Paste',
+                            onClick: () => handlePaste(contextMenu.itemId),
+                          },
+                          ...(clip?.clip_type === 'image'
+                            ? clip.has_ocr_text
+                              ? [
+                                  {
+                                    label: 'Paste recognized text',
+                                    onClick: () => handlePasteOcrText(contextMenu.itemId),
+                                  },
+                                ]
+                              : []
+                            : [
+                                {
+                                  label: 'Paste as plain text',
+                                  onClick: () => handlePaste(contextMenu.itemId, true),
+                                },
+                              ]),
+                          {
+                            label: 'Copy',
+                            onClick: () => handleCopy(contextMenu.itemId),
+                          },
+                          ...(clip?.clip_type === 'image'
+                            ? clip.has_ocr_text
+                              ? [
+                                  {
+                                    label: 'Copy recognized text',
+                                    onClick: () => handleCopyOcrText(contextMenu.itemId),
+                                  },
+                                ]
+                              : []
+                            : [
+                                {
+                                  label: 'Copy as plain text',
+                                  onClick: () => handleCopy(contextMenu.itemId, true),
+                                },
+                              ]),
+                          ...(clip?.folder_id
+                            ? [
+                                {
+                                  label: 'Remove from folder',
+                                  onClick: () => handleMoveClip(contextMenu.itemId, null),
+                                },
+                              ]
+                            : []),
+                          ...folders.map((folder) => ({
+                            label: `移至 ${folder.name}`,
+                            disabled: clip?.folder_id === folder.id,
+                            onClick: () => handleMoveClip(contextMenu.itemId, folder.id),
+                          })),
+                          {
+                            label: 'Delete',
+                            danger: true,
+                            onClick: () => handleDelete(contextMenu.itemId),
+                          },
+                        ];
+                      })()
+                    : [
+                        {
+                          label: 'Rename',
+                          onClick: () => {
+                            setFolderModalMode('rename');
+                            setEditingFolderId(contextMenu.itemId);
+                            const folder = folders.find((f) => f.id === contextMenu.itemId);
+                            setNewFolderName(folder ? folder.name : '');
+                            setShowAddFolderModal(true);
+                          },
+                        },
+                        {
+                          label: 'Delete',
+                          danger: true,
+                          onClick: () => handleDeleteFolder(contextMenu.itemId),
+                        },
+                      ]
+              }
+            />
+          )}
+
+          <ConfirmDialog
+            isOpen={clearRequest !== null}
+            title={clearRequest === 'all' ? 'Clear everything?' : 'Clear unpinned items?'}
+            message={
+              clearRequest === 'all'
+                ? 'Remove every item from Cubby, including pinned items? This cannot be undone.'
+                : 'Remove every unpinned item from Cubby? Your pinned items will stay.'
+            }
+            confirmText={
+              isClearing
+                ? 'Clearing…'
+                : clearRequest === 'all'
+                  ? 'Clear everything'
+                  : 'Clear unpinned'
+            }
+            isBusy={isClearing}
+            onConfirm={() => {
+              if (clearRequest) void handleClearClips(clearRequest);
+            }}
+            onCancel={() => setClearRequest(null)}
+          />
+
+          <FlyoutHeader
+            searchQuery={searchQuery}
+            // Only point aria-activedescendant at a clip that is actually
+            // rendered. After a delete or a filter change the selected id can
+            // outlive its option by a render, and a dangling reference is worse
+            // than none.
+            selectedClipId={
+              visibleClips.some((clip) => clip.id === selectedClipId) ? selectedClipId : null
+            }
+            hasClipListbox={visibleClips.length > 0}
+            onSearchChange={handleSearch}
+            contentFilter={contentFilter}
+            onContentFilterChange={(filter) => {
+              setContentFilter(filter);
+              setSelectedClipId(null);
+              setClipListResetToken((token) => token + 1);
+            }}
+            folders={folders}
+            selectedFolder={selectedFolder}
+            onSelectFolder={handleSelectFolder}
+            onAddFolder={() => {
+              setFolderModalMode('create');
+              setNewFolderName('');
+              setShowAddFolderModal(true);
+            }}
+            onOpenHistoryMenu={handleHistoryMenu}
+            onOpenHistoryWindow={openHistoryWindow}
+            onOpenSettings={openSettings}
+          />
+
+          <main
+            data-el="clip-list-area"
+            className="no-scrollbar relative min-h-0 flex-1 overflow-hidden"
+          >
+            <ClipList
+              clips={visibleClips}
+              isLoading={isLoading || (visibleClips.length === 0 && hasMore)}
+              hasMore={hasMore}
+              resetToken={clipListResetToken}
+              density={density}
+              selectedClipId={selectedClipId}
+              loadError={loadError}
+              emptyTitle={emptyState.title}
+              emptyDescription={emptyState.description}
+              onSelectClip={setSelectedClipId}
+              onPaste={handlePaste}
+              onCopy={handleCopy}
+              onTogglePin={handleTogglePin}
+              onLoadMore={loadMore}
+              onRetry={refreshCurrentFolder}
+              onCardContextMenu={(e, clipId) => handleContextMenu(e, 'card', clipId)}
+              revealedClips={revealed}
+              onToggleReveal={(clipId) => {
+                const clip = clips.find((item) => item.id === clipId);
+                if (clip) void toggleReveal(clip);
+              }}
+            />
+
+            {/* Add/Rename Folder Modal Overlay */}
+            <FolderModal
+              isOpen={showAddFolderModal}
+              mode={folderModalMode}
+              initialName={newFolderName}
+              onClose={() => {
+                setShowAddFolderModal(false);
+                setNewFolderName('');
+              }}
+              onSubmit={handleCreateOrRenameFolder}
+            />
+          </main>
+          <footer className="drag-area flex h-9 shrink-0 items-center border-t border-white/[0.07] px-3 text-[10px] text-muted-foreground">
+            <div className="flex min-w-0 items-center gap-2">
+              <span>{totalClipCount.toLocaleString()} 条记录</span>
+            </div>
+            <div className="ml-auto flex items-center gap-3">
+              <span>
+                <kbd>Enter</kbd> {'Paste'}
+              </span>
+              {(() => {
+                const selected = selectedClipId
+                  ? visibleClips.find((clip) => clip.id === selectedClipId)
+                  : undefined;
+                if (!selected) return null;
+                // Non-images paste as plain text; image results with OCR paste
+                // their recognized text. Images without OCR have no Shift+Enter.
+                if (selected.clip_type !== 'image') {
+                  return (
+                    <span>
+                      <kbd>Shift</kbd>
+                      <kbd>Enter</kbd> Plain
+                    </span>
+                  );
+                }
+                if (selected.has_ocr_text) {
+                  return (
+                    <span>
+                      <kbd>Shift</kbd>
+                      <kbd>Enter</kbd> Text
+                    </span>
+                  );
+                }
+                return null;
+              })()}
+              <span>
+                <kbd>Esc</kbd> Close
+              </span>
+            </div>
+          </footer>
+          <Toaster richColors position="bottom-center" theme={effectiveTheme} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;

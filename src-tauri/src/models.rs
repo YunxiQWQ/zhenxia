@@ -1,0 +1,357 @@
+use serde::{Deserialize, Serialize};
+use sqlx::{sqlite::SqliteRow, FromRow, Row};
+use std::sync::OnceLock;
+
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    pub capture: crate::capture_preferences::CapturePreferences,
+    pub theme: String,
+    pub mica_effect: String,
+    pub max_items: i64,
+    pub auto_delete_days: i64,
+    pub hotkey: String,
+    pub replace_win_v: bool,
+    pub screenshot_hotkey: String,
+    pub pin_hotkey: String,
+    pub ignore_ghost_clips: bool,
+    pub startup_with_windows: bool,
+    pub round_corners: bool,
+    pub float_above_taskbar: bool,
+    pub density: String,
+
+    // First-run onboarding: false until the user dismisses the welcome overlay.
+    pub has_completed_onboarding: bool,
+
+    // Privacy
+    // Skip clipboard content that the source app tags as sensitive (password
+    // managers, etc.). Matches Win+V, which also hides these. On by default.
+    pub skip_sensitive: bool,
+    // Skip text that matches high-confidence secret heuristics (tokens, keys,
+    // payment cards). Off by default (opt-in): heuristic sniffing can drop a
+    // clip the user meant to keep. Never logs matched content when enabled.
+    pub skip_likely_secrets: bool,
+    // When the clipboard is cleared shortly after a capture (typical of password
+    // manager browser extensions that auto-clear), forget that last clip. On by
+    // default: closes the browser-extension gap that ignored-apps cannot cover.
+    // Only empty/clear events qualify — a normal next copy never deletes the
+    // previous item — and only credential-shaped captures are forgotten, so a
+    // manager's timer-based clear cannot delete an unrelated note copied after
+    // the password.
+    pub forget_on_clipboard_clear: bool,
+    // True after the built-in password-manager ignore list has been seeded once.
+    // Clearing an entry in Settings must stick across restarts.
+    pub default_sensitive_apps_seeded: bool,
+    pub ignored_apps: HashSet<String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            capture: crate::capture_preferences::CapturePreferences::default(),
+            theme: "system".to_string(),
+            mica_effect: "solid".to_string(),
+            // 0 = no item-count cap; retention is driven by age (auto_delete_days)
+            // so "keep history for N days" means exactly that. Pinned items are
+            // always kept regardless.
+            max_items: 0,
+            auto_delete_days: 30,
+            hotkey: "Win+Alt+V".to_string(),
+            replace_win_v: true,
+            screenshot_hotkey: "F1".to_string(),
+            pin_hotkey: "F3".to_string(),
+            ignore_ghost_clips: false,
+            startup_with_windows: false,
+            round_corners: true,
+            float_above_taskbar: true,
+            density: "comfortable".to_string(),
+
+            has_completed_onboarding: false,
+
+            skip_sensitive: true,
+            // Heuristic content-sniffing is opt-in: guessing wrong silently drops
+            // a clip the user deliberately copied, which erodes trust fast. The
+            // reliable protections (OS sensitive tag + seeded password-manager
+            // ignore list) stay on by default and cover the important cases.
+            skip_likely_secrets: false,
+            // Default on: browser-extension password copies cannot be filtered by
+            // executable name, and managers almost always auto-clear within seconds.
+            forget_on_clipboard_clear: true,
+            default_sensitive_apps_seeded: false,
+            ignored_apps: HashSet::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Clip {
+    pub id: i64,
+    pub uuid: String,
+    pub clip_type: String,
+    pub content: Vec<u8>,
+    pub text_preview: String,
+    pub content_hash: String,
+    pub folder_id: Option<i64>,
+    pub is_deleted: bool,
+    pub is_pinned: bool,
+    pub is_thumbnail: bool,
+    pub source_app: Option<String>,
+    pub source_icon: Option<String>,
+    pub metadata: Option<String>,
+    pub ocr_text: Option<String>,
+    // Encrypted JSON of the OCR word layout (boxes + reference dimensions) for
+    // image clips (SOU-242). Used to highlight matched words on search results.
+    pub ocr_words: Option<String>,
+    // True once retention has dropped this image clip's full-resolution blob but
+    // kept its thumbnail + ocr_text (SOU-244). Only ever set for `image` clips.
+    pub full_image_expired: bool,
+    // A note the user attached to this clip (SOU-588). Encrypted at rest like
+    // the rest of the clip; None for rows written before the column existed.
+    pub notes: Option<String>,
+    // The user asked for this clip's content to be hidden from the list
+    // (SOU-586). Display state only: the row is still encrypted the same way,
+    // still searchable, and still pastes its real content.
+    pub is_hidden: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_accessed: chrono::DateTime<chrono::Utc>,
+}
+
+impl<'r> FromRow<'r, SqliteRow> for Clip {
+    fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            uuid: row.try_get("uuid")?,
+            clip_type: row.try_get("clip_type")?,
+            content: row.try_get("content")?,
+            text_preview: row.try_get("text_preview")?,
+            content_hash: row.try_get("content_hash")?,
+            folder_id: row.try_get("folder_id")?,
+            is_deleted: row.try_get("is_deleted")?,
+            is_pinned: row.try_get("is_pinned")?,
+            is_thumbnail: row.try_get("is_thumbnail")?,
+            source_app: row.try_get("source_app")?,
+            source_icon: row.try_get("source_icon")?,
+            metadata: row.try_get("metadata")?,
+            ocr_text: row.try_get("ocr_text")?,
+            ocr_words: row.try_get("ocr_words")?,
+            full_image_expired: row.try_get("full_image_expired")?,
+            notes: row.try_get("notes")?,
+            is_hidden: row.try_get("is_hidden")?,
+            created_at: row.try_get("created_at")?,
+            last_accessed: row.try_get("last_accessed")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Folder {
+    pub id: i64,
+    pub name: String,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub is_system: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl<'r> FromRow<'r, SqliteRow> for Folder {
+    fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            icon: row.try_get("icon")?,
+            color: row.try_get("color")?,
+            is_system: row.try_get("is_system")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+pub fn get_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(rt);
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    RUNTIME.set(rt).ok();
+    Ok(RUNTIME.get().unwrap())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardItem {
+    pub id: String,
+    pub clip_type: String,
+    pub content: String,
+    pub preview: String,
+    pub folder_id: Option<String>,
+    pub is_pinned: bool,
+    pub created_at: String,
+    pub source_app: Option<String>,
+    pub source_icon: Option<String>,
+    pub metadata: Option<String>,
+    pub has_ocr_text: bool,
+    pub ocr_match: Option<OcrMatch>,
+    // Word boxes to highlight on an image search result whose OCR text matched
+    // the query (SOU-242 phase 2). None for non-image or non-matching results.
+    pub ocr_highlights: Option<OcrHighlights>,
+    // True when this image's full-resolution blob was dropped by retention but
+    // its thumbnail + OCR text were kept (SOU-244). The UI marks it and stops
+    // offering the full image for paste/copy.
+    pub image_expired: bool,
+    // The user's note for this clip (SOU-588), shown on the row so it can be
+    // recognized without opening it.
+    pub notes: Option<String>,
+    // The user hid this clip's content from the list (SOU-586). When set, this
+    // item carries no content or preview at all — the UI shows a placeholder,
+    // and revealing it for the session fetches the real payload on demand.
+    pub is_hidden: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OcrMatch {
+    pub before: String,
+    pub matched: String,
+    pub after: String,
+}
+
+/// Matched OCR word boxes for one image search result, ready to render as an
+/// overlay. `boxes` are fractions of the image (0..1); `aspect` is the image's
+/// width/height so the frontend can letterbox the thumbnail to that shape and
+/// place the rects with plain percentages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OcrHighlights {
+    pub aspect: f32,
+    pub boxes: Vec<OcrRect>,
+}
+
+/// One highlight rectangle, as fractions of the image dimensions (0..1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OcrRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Every recognized word on an image clip, positioned as fractions of the
+/// image (0..1) so the UI can place them at any zoom without knowing the pixel
+/// dimensions OCR happened to run at. Powers word-level text selection in the
+/// History window's preview.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OcrTextLayout {
+    /// Width/height of the image, so the viewer can letterbox to its true shape.
+    pub aspect: f32,
+    /// Reading order: lines top to bottom, words left to right. A selection is a
+    /// contiguous index range over this list.
+    pub words: Vec<OcrTextWord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OcrTextWord {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Dense line index. Selections join words within a line with spaces and
+    /// across lines with newlines.
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FolderItem {
+    pub id: String,
+    pub name: String,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub is_system: bool,
+    pub item_count: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn removed_remote_settings_cannot_be_reenabled_by_an_old_settings_file() {
+        let settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "hotkey": "Ctrl+Shift+V", "remote_clipboard_relay": true,
+            "remote_paste_mode": "paste_as_keystrokes"
+        })).unwrap();
+        let current = serde_json::to_value(settings).unwrap();
+        assert_eq!(current["hotkey"], "Ctrl+Shift+V");
+        assert!(current.get("remote_clipboard_relay").is_none());
+        assert!(current.get("remote_paste_mode").is_none());
+    }
+
+    #[test]
+    fn existing_settings_keep_their_configured_shortcut() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "theme": "system",
+                "hotkey": "Ctrl+Shift+V"
+            }"#,
+        )
+        .expect("existing settings should remain readable");
+
+        assert_eq!(settings.hotkey, "Ctrl+Shift+V");
+        assert!(settings.replace_win_v);
+        assert_eq!(settings.density, "comfortable");
+    }
+
+    #[test]
+    fn new_settings_use_win_alt_v() {
+        let settings = AppSettings::default();
+
+        assert_eq!(settings.hotkey, "Win+Alt+V");
+        assert!(settings.replace_win_v);
+        assert_eq!(settings.density, "comfortable");
+    }
+
+    #[test]
+    fn secret_privacy_defaults_are_opt_in() {
+        // Omitted in an existing settings.json (upgrade path) and on a fresh
+        // install, heuristic secret sniffing and seeding must both default off
+        // so no clip is silently dropped and seeding runs at most once.
+        let migrated: AppSettings = serde_json::from_str("{}")
+            .expect("settings without the new fields should stay readable");
+        assert!(!migrated.skip_likely_secrets);
+        assert!(!migrated.default_sensitive_apps_seeded);
+        // Auto-clear forget is default-on even for upgrades (browser-extension gap).
+        assert!(migrated.forget_on_clipboard_clear);
+
+        let fresh = AppSettings::default();
+        assert!(!fresh.skip_likely_secrets);
+        assert!(!fresh.default_sensitive_apps_seeded);
+        assert!(fresh.forget_on_clipboard_clear);
+
+        // The deterministic protection stays on regardless.
+        assert!(fresh.skip_sensitive);
+    }
+
+    #[test]
+    fn persisted_secret_privacy_values_survive_deserialization() {
+        // A user who opts in, or a machine that has already seeded, must keep
+        // those choices across restarts.
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "skip_likely_secrets": true,
+                "default_sensitive_apps_seeded": true,
+                "forget_on_clipboard_clear": false
+            }"#,
+        )
+        .expect("explicitly persisted privacy flags should round-trip");
+
+        assert!(settings.skip_likely_secrets);
+        assert!(settings.default_sensitive_apps_seeded);
+        assert!(!settings.forget_on_clipboard_clear);
+    }
+}
