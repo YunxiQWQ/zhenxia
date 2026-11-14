@@ -17,7 +17,6 @@ import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { useTheme } from '../hooks/useTheme';
 import { invoke } from '@tauri-apps/api/core';
 import { emit, listen } from '@tauri-apps/api/event';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import { toast } from 'sonner';
 import { AboutTab } from './settings/AboutTab';
 import { FoldersTab } from './settings/FoldersTab';
@@ -289,7 +288,7 @@ export function SettingsPanel({ settings: initialSettings, onClose }: SettingsPa
           className="flex items-center justify-between border-b border-border px-4 py-3"
           onMouseDown={(e) => {
             if (e.button === 0) {
-              getCurrentWindow().startDragging();
+              void invoke('start_window_drag');
             }
           }}
         >
