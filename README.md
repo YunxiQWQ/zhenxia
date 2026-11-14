@@ -2,11 +2,11 @@
 
 Windows 剪贴板历史、截图与标注工具。以 Cubby 为主体，整合 LaterScreen Rust 引擎，并参考轻雪的截图与贴图工作流。
 
-**本地开发版本：0.2.4；当前公开发行版：0.2.1。** 支持中文和英文。项目仍在完善，已有功能不代表与轻雪的全部能力一致。
+**当前版本：0.2.4。** 支持中文和英文。[更新说明](docs/RELEASE-0.2.4.md)。项目仍在完善，已有功能不代表与轻雪的全部能力一致。
 
 ## 下载与运行
 
-从 [Releases](https://github.com/YunxiQWQ/zhenxia/releases) 下载安装版 `Zhenxia-0.2.1-windows-x64-setup.exe`，安装后可在“设置 → 常规 → 开机启动”开启登录 Windows 时自动运行。默认不自动开启。安装版数据保存在 `%APPDATA%\Zhenxia`，卸载保留历史数据。
+从 [v0.2.4 Releases](https://github.com/YunxiQWQ/zhenxia/releases/tag/v0.2.4) 下载安装版 `Zhenxia-0.2.4-windows-x64-setup.exe`，安装后可在“设置 → 常规 → 开机启动”开启登录 Windows 时自动运行。默认不自动开启。安装版数据保存在 `%APPDATA%\Zhenxia`，卸载保留历史数据。
 
 也可下载 Windows x64 便携包，解压后运行 `Zhenxia.exe`。便携版的开机启动设置保持禁用；需要开机启动请使用安装版。保留同目录的 `portable.txt` 和 `data`；更新时退出程序、替换程序文件，保留原 `data`。不要同时运行多个替代 Win+V 的剪贴板程序。
 
