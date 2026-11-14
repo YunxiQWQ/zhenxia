@@ -9,12 +9,13 @@ Zhenxia is a modified combined work distributed under **GPL-3.0-only**. The full
 | LaterScreen, copyright 2026 Mi Ji | MIT | https://github.com/crazykun/LaterScreen ; snapshot `5a0ca2227bc02f53333fb62fa0b56e216a80ed4c` | Vendored, modified `lscreen-core` and `lscreen-capture` engines; full MIT text in `LICENSE-LaterScreen.txt` and `src-tauri/engines/LICENSE-LaterScreen` |
 | SnowAir, by Liuyiran / CM-idea | Apache-2.0 | https://github.com/CM-idea/SnowAir ; reference settings snapshot `0345a08ce131d9effabcd41e247c5c5a5edaa336` | Interface and workflow reference, including attribution for inherited reference material; `LICENSE-SnowAir.txt` |
 | Microsoft PowerToys | MIT | https://github.com/microsoft/PowerToys | Behavioral reference for Cubby's independently implemented Win+V mapping; see `NOTICE.md` |
+| windows-capture, by NiiightmareXD | MIT | https://github.com/NiiightmareXD/windows-capture ; crate `2.0.1`, checksum pinned in Cargo.lock | On-demand Windows Graphics Capture for recording; full upstream notice in THIRD-PARTY-NOTICES.txt |
 
 The application does not include or launch SnowAir's executable, Qt, its unpublished custom Ling implementation, or the LaterScreen application executable. Only the vendored Rust engines listed above are compiled into Zhenxia.
 
 ## Recording implementation
 
-MP4 encoding calls Windows Media Foundation, a system API. GIF encoding uses the MIT/Apache-licensed `image`/`gif` Rust libraries. **gifski and FFmpeg are not linked or bundled.** The previous conditional gifski/AGPL note does not describe this implementation. There is no separately installed recording daemon or encoder process.
+Frame acquisition reuses the MIT-licensed `windows-capture` crate; compatibility capture reuses the existing LaterScreen/xcap path. MP4 encoding calls Windows Media Foundation, a system API. GIF encoding uses the MIT/Apache-licensed `image`/`gif` Rust libraries. **gifski and FFmpeg are not linked or bundled.** The previous conditional gifski/AGPL note does not describe this implementation. There is no separately installed recording daemon or encoder process.
 
 ## Other dependencies
 

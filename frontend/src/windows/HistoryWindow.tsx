@@ -1255,6 +1255,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
             }}
             onActivate={handlePaste}
             onCopy={handleCopy}
+            onQuickPaste={handlePaste}
             revealedClips={revealed}
             onToggleReveal={handleToggleReveal}
             onTogglePin={handleTogglePin}
@@ -1288,7 +1289,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
               onClick={() => selectedClip && void handlePaste(selectedClip.id)}
             >
               <ClipboardPaste size={13} />
-              Paste
+              {t('Paste')}
             </button>
           </div>
           <div className="min-h-0 flex-1">

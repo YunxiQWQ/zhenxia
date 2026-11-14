@@ -67,7 +67,8 @@ import './image-editor.css';
 import { useCaptureSettings } from '../hooks/useCaptureSettings';
 import { shortcutAction } from '../utils/capturePreferences';
 import { toolbarColors } from '../components/CaptureToolbar';
-import { ScanText, Languages } from 'lucide-react';
+import { ScanText, ScanQrCode, Languages } from 'lucide-react';
+import { QrResultDialog } from '../components/QrResultDialog';
 
 interface Props {
   initialWatermark?: boolean;
@@ -587,6 +588,21 @@ export default function ImageEditor({
       if (alive.current) setBusy(false);
     }
   };
+  const [qrCodes, setQrCodes] = useState<string[] | null>(null);
+  const scanQr = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      const imageBase64 = await encodeDocument(doc);
+      const codes = await invoke<string[]>('scan_qr_image', { imageBase64 });
+      if (alive.current) setQrCodes(codes);
+    } catch (e) {
+      if (alive.current) setError(String(e));
+    } finally {
+      if (alive.current) setBusy(false);
+    }
+  };
   const requestClose = () => {
     if (busy) return;
     if (dirty || textRef.current?.value) setConfirmClose(true);
@@ -648,8 +664,12 @@ export default function ImageEditor({
           actual_size: () => changeZoom(1),
           zoom_in: () => changeZoom(zoom * 1.25),
           zoom_out: () => changeZoom(zoom * 0.8),
-          watermark: () => {setWatermarkDraft(storedDoc.watermark??DEFAULT_WATERMARK);setWatermarkOpen(true)},
+          watermark: () => {
+            setWatermarkDraft(storedDoc.watermark ?? DEFAULT_WATERMARK);
+            setWatermarkOpen(true);
+          },
           ocr: () => void recognizeImage(false),
+          qr: () => void scanQr(),
           translate: () => void recognizeImage(true),
         };
         if (actions[action]) {
@@ -823,6 +843,7 @@ export default function ImageEditor({
             () => void recognizeImage(false),
             busy
           )}
+          {button(ScanQrCode, l('Scan QR code', '扫一扫'), () => void scanQr(), busy)}
           {button(
             Languages,
             l('Translate image', '翻译图片'),
@@ -1341,6 +1362,7 @@ export default function ImageEditor({
           onCancel={() => setWatermarkOpen(false)}
         />
       )}
+      {qrCodes !== null && <QrResultDialog codes={qrCodes} onClose={() => setQrCodes(null)} />}
       {textResult && (
         <div className="ie-modal-backdrop">
           <section

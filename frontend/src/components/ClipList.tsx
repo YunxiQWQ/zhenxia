@@ -19,6 +19,7 @@ interface ClipListProps {
   onPaste: (clipId: string) => void;
   onActivate?: (clipId: string) => void;
   onCopy: (clipId: string) => void;
+  onQuickPaste?: (clipId: string) => void;
   onTogglePin: (clipId: string) => void;
   onLoadMore: () => void;
   onRetry: () => void;
@@ -58,6 +59,7 @@ export function ClipList({
   onPaste,
   onActivate,
   onCopy,
+  onQuickPaste,
   onTogglePin,
   onLoadMore,
   onRetry,
@@ -202,6 +204,7 @@ export function ClipList({
             onPaste={() => onPaste(clip.id)}
             onActivate={onActivate ? () => onActivate(clip.id) : undefined}
             onCopy={() => onCopy(clip.id)}
+            onQuickPaste={onQuickPaste ? () => onQuickPaste(clip.id) : undefined}
             onTogglePin={() => onTogglePin(clip.id)}
             onContextMenu={(event) => onCardContextMenu?.(event, clip.id)}
             revealed={revealedClips?.get(clip.id)}

@@ -13,9 +13,10 @@ pub(crate) fn build(app: &AppHandle, language: &str) -> tauri::Result<Menu<tauri
     let separator = PredefinedMenuItem::separator(app)?;
     let exit = MenuItem::with_id(app, "quit", quit, true, None::<&str>)?;
     let en=language=="en";
+    let qr=MenuItem::with_id(app,"scan_qr",if en{"Scan QR code"}else{"扫一扫"},true,None::<&str>)?;
     let scroll=MenuItem::with_id(app,"scroll",if en{"Scrolling capture"}else{"长截图"},true,None::<&str>)?;
     let record=MenuItem::with_id(app,"record",if en{"Screen recording"}else{"录屏"},true,None::<&str>)?;
     let presentation=MenuItem::with_id(app,"presentation",if en{"Presentation / restore controls"}else{"演示画布 / 恢复演示操作"},true,None::<&str>)?;
     let controls=MenuItem::with_id(app,"workflow",if en{"Active capture controls"}else{"当前捕获控制（停止 / 完成）"},true,None::<&str>)?;
-    Menu::with_items(app, &[&title, &history, &scroll, &record, &presentation, &controls, &separator, &exit])
+    Menu::with_items(app, &[&title, &history, &qr, &scroll, &record, &presentation, &controls, &separator, &exit])
 }

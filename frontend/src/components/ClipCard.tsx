@@ -4,7 +4,17 @@ import { invoke } from '@tauri-apps/api/core';
 import { ClipboardItem } from '../types';
 import { clsx } from 'clsx';
 import { memo, useMemo } from 'react';
-import { Clock, Copy, Eye, EyeOff, File, Image as ImageIcon, Pin, StickyNote } from 'lucide-react';
+import {
+  Clock,
+  Copy,
+  ClipboardPaste,
+  Eye,
+  EyeOff,
+  File,
+  Image as ImageIcon,
+  Pin,
+  StickyNote,
+} from 'lucide-react';
 import { formatDistanceToNowStrict } from 'date-fns';
 import { PREVIEW_CHAR_LIMIT } from '../constants';
 import { useTimeTick } from '../hooks/useTimeTick';
@@ -32,6 +42,7 @@ interface ClipCardProps {
   onPaste: () => void;
   onActivate?: () => void;
   onCopy: () => void;
+  onQuickPaste?: () => void;
   onTogglePin: () => void;
   onContextMenu?: (e: React.MouseEvent) => void;
   /** Content revealed for this session despite the persisted hidden flag.
@@ -76,6 +87,7 @@ export const ClipCard = memo(function ClipCard({
   onPaste,
   onActivate,
   onCopy,
+  onQuickPaste,
   onTogglePin,
   onContextMenu,
   posInSet,
@@ -428,13 +440,13 @@ export const ClipCard = memo(function ClipCard({
           type="button"
           onClick={(event) => {
             event.stopPropagation();
-            onCopy();
+            (onQuickPaste ?? onCopy)();
           }}
           className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-white/10 hover:text-foreground"
-          title="Copy"
-          aria-label="Copy clip"
+          title={onQuickPaste ? (lang === 'zh-CN' ? '粘贴' : 'Paste') : 'Copy'}
+          aria-label={onQuickPaste ? (lang === 'zh-CN' ? '粘贴记录' : 'Paste clip') : 'Copy clip'}
         >
-          <Copy size={13} />
+          {onQuickPaste ? <ClipboardPaste size={13} /> : <Copy size={13} />}
         </button>
       </div>
     </article>

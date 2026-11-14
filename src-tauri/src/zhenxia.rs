@@ -873,9 +873,13 @@ pub async fn cancel_screenshot(app: AppHandle, session_id: String) -> Result<(),
 
 #[tauri::command]
 pub async fn screenshot_tool_action(app:AppHandle,db:tauri::State<'_,Arc<Database>>,session_id:String,crop:Option<CropRegion>,elements:Vec<AnnotationElementDto>,action:String)->Result<serde_json::Value,String>{
-    if !["ocr","translate","save"].contains(&action.as_str()){return Err("Unknown screenshot action".into());}
+    if !["ocr","translate","save","qr"].contains(&action.as_str()){return Err("Unknown screenshot action".into());}
     let (source,width,height)={let sessions=desktop_sessions().lock().unwrap();let s=sessions.get(&session_id).ok_or("Screenshot session expired")?;(s.source.clone(),s.width,s.height)};
     let png=tauri::async_runtime::spawn_blocking(move||{let mut png=source.png(width,height)?;if !elements.is_empty(){png=render_annotation_png(&png,&elements)?;}crop_image_png(png,crop)}).await.map_err(|e|e.to_string())??;
+    if action=="qr" {
+        let codes=tauri::async_runtime::spawn_blocking(move||crate::qr_scan::detect(&png)).await.map_err(|e|e.to_string())??;
+        return Ok(serde_json::json!({"codes":codes}));
+    }
     if action=="save"{
         let output=png.clone();let dialog_app=app.clone();
         let path=tauri::async_runtime::spawn_blocking(move||save_png_dialog(&dialog_app,&output,"Zhenxia.png")).await.map_err(|e|e.to_string())??;

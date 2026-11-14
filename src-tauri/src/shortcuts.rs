@@ -49,6 +49,8 @@ fn parser_hotkey(hotkey: &str) -> String {
             let trimmed = token.trim();
             if trimmed.eq_ignore_ascii_case("win") || trimmed.eq_ignore_ascii_case("windows") {
                 "Super"
+            } else if ["·", "`", "~"].contains(&trimmed) {
+                "Backquote"
             } else {
                 trimmed
             }
@@ -76,10 +78,10 @@ enum ShortcutAction {
     RegionOcr,
     RegionTranslate,
     HidePins,
-    ScrollCapture, RecordScreen, Presentation,
+    ScrollCapture, RecordScreen, Presentation, ScanQr,
 }
 
-fn extra_action(id:&str)->Result<ShortcutAction,String>{match id{"capture_history"=>Ok(ShortcutAction::CaptureHistory),"open_settings"=>Ok(ShortcutAction::Settings),"translate"=>Ok(ShortcutAction::Translate),"region_ocr"=>Ok(ShortcutAction::RegionOcr),"region_translate"=>Ok(ShortcutAction::RegionTranslate),"hide_pins"=>Ok(ShortcutAction::HidePins),"scroll_capture"=>Ok(ShortcutAction::ScrollCapture),"record_screen"=>Ok(ShortcutAction::RecordScreen),"presentation"=>Ok(ShortcutAction::Presentation),_=>Err("Unknown shortcut action".into())}}
+fn extra_action(id:&str)->Result<ShortcutAction,String>{match id{"capture_history"=>Ok(ShortcutAction::CaptureHistory),"open_settings"=>Ok(ShortcutAction::Settings),"translate"=>Ok(ShortcutAction::Translate),"region_ocr"=>Ok(ShortcutAction::RegionOcr),"region_translate"=>Ok(ShortcutAction::RegionTranslate),"hide_pins"=>Ok(ShortcutAction::HidePins),"scroll_capture"=>Ok(ShortcutAction::ScrollCapture),"record_screen"=>Ok(ShortcutAction::RecordScreen),"presentation"=>Ok(ShortcutAction::Presentation),"scan_qr"=>Ok(ShortcutAction::ScanQr),_=>Err("Unknown shortcut action".into())}}
 fn canonical(value:&str)->Result<String,String>{Shortcut::from_str(&parser_hotkey(value)).map(|k|k.to_string()).map_err(|_|format!("无效快捷键：{value}"))}
 pub fn validate_local(bindings:&BTreeMap<String,String>)->Result<(),String>{
     let mut complete=crate::capture_preferences::CapturePreferences::default().shortcuts;let mut seen=BTreeMap::new();
@@ -262,6 +264,7 @@ fn register_action(
                 ShortcutAction::ScrollCapture|ShortcutAction::RecordScreen=>{let kind=if matches!(action,ShortcutAction::ScrollCapture){"scroll"}else{"record"};let handle=app.clone();tauri::async_runtime::spawn(async move{if let Err(e)=crate::workflows::start_workflow_capture(handle,kind.into()).await{log::warn!("Capture workflow: {e}");}});},
                 ShortcutAction::Presentation=>{let handle=app.clone();tauri::async_runtime::spawn(async move{let _=crate::workflows::start_presentation(handle).await;});},
                 ShortcutAction::HidePins=>{crate::zhenxia::toggle_pins_visible(app);}
+                ShortcutAction::ScanQr=>{let handle=app.clone();tauri::async_runtime::spawn(async move{if let Err(error)=crate::qr_scan::start_qr_capture(handle.clone()).await{let _=handle.emit("zhenxia-notice",error);}});}
             }
         })
         .map_err(|error| format!("Failed to register shortcut: {error:?}"))
@@ -304,6 +307,11 @@ mod tests {
     #[test]
     fn preserves_other_shortcut_tokens() {
         assert_eq!(parser_hotkey("Ctrl+Shift+V"), "Ctrl+Shift+V");
+    }
+    #[test]
+    fn chinese_middle_dot_alias_uses_the_same_physical_oem_key() {
+        assert_eq!(super::canonical("Ctrl+·").unwrap(), super::canonical("Ctrl+Backquote").unwrap());
+        assert_eq!(super::canonical("Ctrl+`").unwrap(), super::canonical("Ctrl+Backquote").unwrap());
     }
 
     #[test]

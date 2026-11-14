@@ -210,8 +210,8 @@ export function ComponentsTab({
         <Row
           title={text('外部图片查看器', 'External image viewer')}
           desc={text(
-            '可选择已安装的果核看图或其他查看器；截图历史中可直接打开。',
-            'Choose an installed image viewer to open images from capture history.'
+            '默认使用系统图片查看器，也可选择其他程序；无需安装指定软件。',
+            'Uses your default image viewer. Optionally choose another app.'
           )}
           control={
             <button

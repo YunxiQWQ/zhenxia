@@ -61,6 +61,7 @@ export function HotkeysTab({
     ['open_settings', '打开设置', 'Open settings'],
     ['translate', '离线翻译', 'Offline translation'],
     ['region_ocr', '区域文字识别', 'Recognize screen text'],
+    ['scan_qr', '扫一扫', 'Scan QR code'],
     ['region_translate', '区域翻译', 'Translate screen region'],
     ['hide_pins', '隐藏 / 恢复所有贴图', 'Hide / restore pinned images'],
   ] as const;

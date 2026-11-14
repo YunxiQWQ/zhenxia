@@ -1,6 +1,7 @@
 import type { CSSProperties } from 'react';
 import {
-  ScanLine,
+  ScanQrCode,
+  GalleryVerticalEnd,
   Video,
   Stamp,
   MousePointer2,
@@ -30,7 +31,8 @@ import {
 } from '../utils/capturePreferences';
 import { useTranslation } from '../i18n';
 export const CAPTURE_ICONS = {
-  scroll: ScanLine,
+  scroll: GalleryVerticalEnd,
+  qr: ScanQrCode,
   record: Video,
   watermark: Stamp,
   select: MousePointer2,

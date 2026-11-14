@@ -68,6 +68,37 @@ it('does not save when a drag is cancelled', () => {
   fireEvent.pointerCancel(item, { pointerId: 1 });
   expect(update).not.toHaveBeenCalled();
 });
+it('hides by dragging to the hidden zone and never hides finish/cancel', () => {
+  const update = setup();
+  const target = document.querySelector('[data-el="hidden-tools"]')!;
+  vi.mocked(document.elementFromPoint).mockReturnValue(target);
+  const drag = (id: string) => {
+    const from = document.querySelector(`[data-tool-order="${id}"]`)!;
+    fireEvent.pointerDown(from, { button: 0, pointerId: 1, clientX: -30, clientY: 20 });
+    fireEvent.pointerMove(from, { pointerId: 1, clientX: 20, clientY: 20 });
+    fireEvent.pointerUp(from, { pointerId: 1, clientX: 20, clientY: 20 });
+  };
+  drag('pen');
+  expect(update.mock.calls[0][1].toolbar_hidden).toContain('pen');
+  update.mockClear();
+  drag('confirm');
+  drag('cancel');
+  expect(update).not.toHaveBeenCalled();
+});
+it('restores a hidden tool by dragging to an exact place without a second click', () => {
+  const update = setup();
+  const source = document.querySelector('[data-hidden-tool="ellipse"]')!;
+  vi.mocked(document.elementFromPoint).mockReturnValue(
+    document.querySelector('[data-tool-order="rect"]')
+  );
+  fireEvent.pointerDown(source, { button: 0, pointerId: 1, clientX: -30, clientY: 20 });
+  fireEvent.pointerMove(source, { pointerId: 1, clientX: 0, clientY: 20 });
+  fireEvent.pointerUp(source, { pointerId: 1, clientX: 0, clientY: 20 });
+  fireEvent.click(source);
+  expect(update).toHaveBeenCalledTimes(1);
+  expect(update.mock.calls[0][1].toolbar_hidden).not.toContain('ellipse');
+  expect(update.mock.calls[0][1].toolbar_order.slice(0, 3)).toEqual(['select', 'ellipse', 'rect']);
+});
 it('accepts pointer moves and release before React commits the drag indicator', () => {
   const update = setup();
   act(() => dragTool('pen', 'rect'));

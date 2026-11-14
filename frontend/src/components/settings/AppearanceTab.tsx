@@ -37,6 +37,8 @@ export function AppearanceTab({
     element: HTMLDivElement;
   } | null>(null);
   const [dropTarget, setDropTarget] = useState<CaptureAction | null>(null);
+  const [dropHidden, setDropHidden] = useState(false);
+  const draggedClick = useRef(false);
   const p = capturePreferences(settings);
   const visibleTools = p.toolbar_order.filter((id) => !p.toolbar_hidden.includes(id));
   const patch = (updates: Partial<typeof p>) => updateSetting('capture', { ...p, ...updates });
@@ -57,6 +59,7 @@ export function AppearanceTab({
       current.element.releasePointerCapture(current.pointer);
     setDrag(null);
     setDropTarget(null);
+    setDropHidden(false);
   }, []);
   useEffect(() => {
     const cancel = (event: KeyboardEvent) => {
@@ -74,10 +77,53 @@ export function AppearanceTab({
     if (hit?.closest('[data-el="hidden-tools"]')) return { hidden: true } as const;
     const element = hit?.closest<HTMLDivElement>('[data-tool-order]');
     const id = p.toolbar_order.find((tool) => tool === element?.dataset.toolOrder);
-    if (!id || !element) return null;
+    if (!id || !element) {
+      if (hit?.closest('[data-el="toolbar-order"]'))
+        return { hidden: false, id: visibleTools[visibleTools.length - 1], after: true } as const;
+      return null;
+    }
     const bounds = element.getBoundingClientRect();
     return { hidden: false, id, after: x > bounds.left + bounds.width / 2 } as const;
   };
+  const dragHandlers = (id: CaptureAction) => ({
+    onPointerDown: (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.button !== 0 || (e.target as Element).closest('[data-hide-tool]')) return;
+      e.preventDefault();
+      draggedClick.current = false;
+      e.currentTarget.setPointerCapture(e.pointerId);
+      pointerDrag.current = {
+        source: id,
+        pointer: e.pointerId,
+        x: e.clientX,
+        y: e.clientY,
+        moved: false,
+        element: e.currentTarget,
+      };
+    },
+    onPointerMove: (e: React.PointerEvent<HTMLDivElement>) => {
+      const current = pointerDrag.current;
+      if (!current || current.pointer !== e.pointerId) return;
+      if (!current.moved && Math.hypot(e.clientX - current.x, e.clientY - current.y) < 5) return;
+      current.moved = true;
+      draggedClick.current = true;
+      setDrag(current.source);
+      const target = hitTool(e.clientX, e.clientY);
+      setDropTarget(target && !target.hidden ? target.id : null);
+      setDropHidden(target?.hidden === true);
+    },
+    onPointerUp: (e: React.PointerEvent<HTMLDivElement>) => {
+      const current = pointerDrag.current;
+      if (!current || current.pointer !== e.pointerId) return;
+      const target = current.moved ? hitTool(e.clientX, e.clientY) : null;
+      if (target?.hidden) hide(current.source);
+      else if (target && target.id !== current.source)
+        move(current.source, target.id, target.after);
+      clearDrag();
+    },
+    onPointerCancel: clearDrag,
+    onLostPointerCapture: clearDrag,
+    onDragStart: (e: React.DragEvent) => e.preventDefault(),
+  });
   const label = (id: CaptureAction) => CAPTURE_ACTIONS.find((a) => a[0] === id)?.[zh ? 1 : 2] ?? id;
   return (
     <div className="space-y-5" data-el="appearance-settings">
@@ -132,45 +178,7 @@ export function AppearanceTab({
                 return (
                   <div
                     key={id}
-                    onPointerDown={(e) => {
-                      if (e.button !== 0 || (e.target as Element).closest('button')) return;
-                      e.preventDefault();
-                      e.currentTarget.setPointerCapture(e.pointerId);
-                      pointerDrag.current = {
-                        source: id,
-                        pointer: e.pointerId,
-                        x: e.clientX,
-                        y: e.clientY,
-                        moved: false,
-                        element: e.currentTarget,
-                      };
-                    }}
-                    onPointerMove={(e) => {
-                      const current = pointerDrag.current;
-                      if (!current || current.pointer !== e.pointerId) return;
-                      if (
-                        !current.moved &&
-                        Math.hypot(e.clientX - current.x, e.clientY - current.y) < 5
-                      )
-                        return;
-                      current.moved = true;
-                      setDrag(current.source);
-                      const target = hitTool(e.clientX, e.clientY);
-                      setDropTarget(target && !target.hidden ? target.id : null);
-                    }}
-                    onPointerUp={(e) => {
-                      const current = pointerDrag.current;
-                      if (!current || current.pointer !== e.pointerId) return;
-                      const target = current.moved ? hitTool(e.clientX, e.clientY) : null;
-                      if (target?.hidden) hide(current.source);
-                      else if (target && target.id !== current.source) {
-                        move(current.source, target.id, target.after);
-                      }
-                      clearDrag();
-                    }}
-                    onPointerCancel={clearDrag}
-                    onLostPointerCapture={clearDrag}
-                    onDragStart={(e) => e.preventDefault()}
+                    {...dragHandlers(id)}
                     className={`flex cursor-grab items-center gap-2 rounded-lg border border-border bg-accent/25 p-2 active:cursor-grabbing ${drag === id ? 'opacity-40' : ''} ${dropTarget === id ? 'ring-2 ring-primary' : ''}`}
                     style={{ touchAction: 'none' }}
                     data-tool-order={id}
@@ -181,6 +189,7 @@ export function AppearanceTab({
                     <span className="text-xs">{label(id)}</span>
                     {!['cancel', 'confirm'].includes(id) && (
                       <button
+                        data-hide-tool
                         aria-label={`${label(id)} ${text('隐藏', 'hide')}`}
                         className="p-1 text-muted-foreground"
                         onClick={() => hide(id)}
@@ -193,26 +202,39 @@ export function AppearanceTab({
               })}
             </div>
             <div
-              className="mt-4 min-h-16 rounded-lg border border-dashed border-border p-3"
+              className={`mt-4 min-h-16 rounded-lg border border-dashed p-3 ${dropHidden ? 'border-primary bg-primary/10' : 'border-border'}`}
               data-el="hidden-tools"
             >
               <p className="mb-2 text-xs text-muted-foreground">
                 {text(
-                  '拖到这里隐藏；点击隐藏的工具可恢复。',
-                  'Drop here to hide. Click a hidden tool to restore it.'
+                  '拖到这里隐藏，拖回上方恢复并排列。完成和取消不能隐藏。',
+                  'Drag here to hide; drag back above to restore and reorder. Finish and cancel stay visible.'
                 )}
               </p>
               <div className="flex flex-wrap gap-2">
                 {p.toolbar_hidden.map((id) => (
-                  <button
+                  <div
                     key={id}
-                    className={ghostButton}
-                    onClick={() =>
-                      patch({ toolbar_hidden: p.toolbar_hidden.filter((x) => x !== id) })
-                    }
+                    {...dragHandlers(id)}
+                    data-hidden-tool={id}
+                    role="button"
+                    tabIndex={0}
+                    style={{ touchAction: 'none' }}
+                    className={`${ghostButton} flex cursor-grab items-center gap-2 active:cursor-grabbing ${drag === id ? 'opacity-40' : ''}`}
+                    onClick={() => {
+                      if (!draggedClick.current)
+                        patch({ toolbar_hidden: p.toolbar_hidden.filter((x) => x !== id) });
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        patch({ toolbar_hidden: p.toolbar_hidden.filter((x) => x !== id) });
+                      }
+                    }}
                   >
+                    <GripVertical size={13} />
                     {label(id)}
-                  </button>
+                  </div>
                 ))}
               </div>
             </div>

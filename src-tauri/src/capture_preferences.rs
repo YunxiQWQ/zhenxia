@@ -32,12 +32,12 @@ pub struct CapturePreferences {
     pub viewer_path: String,
 }
 
-pub const TOOLBAR_ACTIONS: &[&str] = &["select","rect","ellipse","arrow","pen","text","marker","highlight","mosaic","eraser","undo","redo","edit","ocr","translate","save","pin","scroll","record","watermark","cancel","confirm"];
-pub const GLOBAL_ACTIONS: &[&str] = &["capture_history","open_settings","translate","region_ocr","region_translate","hide_pins","scroll_capture","record_screen","presentation"];
+pub const TOOLBAR_ACTIONS: &[&str] = &["select","rect","ellipse","arrow","pen","text","marker","highlight","mosaic","eraser","undo","redo","edit","ocr","translate","qr","save","pin","scroll","record","watermark","cancel","confirm"];
+pub const GLOBAL_ACTIONS: &[&str] = &["capture_history","open_settings","translate","region_ocr","region_translate","scan_qr","hide_pins","scroll_capture","record_screen","presentation"];
 
 impl Default for CapturePreferences {
     fn default() -> Self {
-        let shortcuts = [("select","V"),("rect","R"),("ellipse","E"),("arrow","A"),("pen","B"),("text","T"),("marker","N"),("highlight","H"),("mosaic","M"),("eraser","X"),("undo","Ctrl+Z"),("redo","Ctrl+Shift+Z"),("edit","Ctrl+E"),("ocr","Ctrl+O"),("translate","Ctrl+T"),("save","Ctrl+S"),("pin","Ctrl+P"),("confirm","Enter"),("copy","Ctrl+C"),("next_candidate","Tab"),("pan","Space"),("crop","C"),("line","L"),("remove","Delete"),("rotate_left","Ctrl+Alt+ArrowLeft"),("rotate_right","Ctrl+Alt+ArrowRight"),("flip_x","Ctrl+Alt+H"),("flip_y","Ctrl+Shift+V"),("fit","Ctrl+0"),("actual_size","Ctrl+1"),("zoom_in","Ctrl+Equal"),("zoom_out","Ctrl+Minus"),("finish_editor","Ctrl+Enter"),("toggle_top","Alt+P"),("scroll",""),("record",""),("watermark","")].into_iter().map(|(k,v)|(k.into(),v.into())).collect();
+        let shortcuts = [("select","V"),("rect","R"),("ellipse","E"),("arrow","A"),("pen","B"),("text","T"),("marker","N"),("highlight","H"),("mosaic","M"),("eraser","X"),("undo","Ctrl+Z"),("redo","Ctrl+Shift+Z"),("edit","Ctrl+E"),("ocr","Ctrl+O"),("translate","Ctrl+T"),("save","Ctrl+S"),("pin","Ctrl+P"),("confirm","Enter"),("copy","Ctrl+C"),("next_candidate","Tab"),("pan","Space"),("crop","C"),("line","L"),("remove","Delete"),("rotate_left","Ctrl+Alt+ArrowLeft"),("rotate_right","Ctrl+Alt+ArrowRight"),("flip_x","Ctrl+Alt+H"),("flip_y","Ctrl+Shift+V"),("fit","Ctrl+0"),("actual_size","Ctrl+1"),("zoom_in","Ctrl+Equal"),("zoom_out","Ctrl+Minus"),("finish_editor","Ctrl+Enter"),("toggle_top","Alt+P"),("scroll",""),("record",""),("watermark",""),("qr","")].into_iter().map(|(k,v)|(k.into(),v.into())).collect();
         Self { toolbar_theme:"dark".into(),toolbar_colors:ToolbarColors::default(),toolbar_order:TOOLBAR_ACTIONS.iter().map(|x|x.to_string()).collect(),toolbar_hidden:vec!["ellipse".into(),"highlight".into(),"redo".into()],toolbar_scale:100,shortcuts,global_hotkeys:BTreeMap::new(),ocr_engine:"windows".into(),ocr_variant:"tiny".into(),translate_source:"auto".into(),translate_target:"en".into(),pin_border:true,pin_opacity:100,viewer_path:String::new() }
     }
 }

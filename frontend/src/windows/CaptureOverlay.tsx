@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { GripVertical, X, Copy } from 'lucide-react';
 import { tGlobal } from '../i18n';
 import { useCaptureSettings } from '../hooks/useCaptureSettings';
+import { QrResultDialog } from '../components/QrResultDialog';
 import { CaptureToolbarButtons, toolbarStyle } from '../components/CaptureToolbar';
 import { CAPTURE_ACTIONS, shortcutAction, type CaptureAction } from '../utils/capturePreferences';
 import { flushSync } from 'react-dom';
@@ -101,6 +102,7 @@ export function CaptureOverlay() {
   const { preferences, systemTheme } = useCaptureSettings();
   const [redoStack, setRedoStack] = useState<AnnotationElement[][]>([]);
   const [result, setResult] = useState<{ text: string; translated?: string | null } | null>(null);
+  const [qrCodes, setQrCodes] = useState<string[] | null>(null);
   const [completedSelection, setCompletedSelection] = useState(0);
   const autoHandled = useRef(false);
   const actionSerial = useRef(0);
@@ -214,6 +216,7 @@ export function CaptureOverlay() {
       toolbarDrag.current = null;
       setRedoStack([]);
       setResult(null);
+      setQrCodes(null);
       setCompletedSelection(0);
       autoHandled.current = false;
       actionSerial.current++;
@@ -665,13 +668,13 @@ export function CaptureOverlay() {
     setRedoStack(redoStack.slice(0, -1));
   };
   const handleToolAction = useCallback(
-    async (action: 'ocr' | 'translate' | 'save') => {
+    async (action: 'ocr' | 'translate' | 'save' | 'qr') => {
       if (!session || busy || !selection || selection.w < 4 || selection.h < 4) return;
       const serial = ++actionSerial.current;
       setBusy(true);
       setError('');
       try {
-        const value = await invoke<{ text?: string; translated?: string | null }>(
+        const value = await invoke<{ text?: string; translated?: string | null; codes?: string[] }>(
           'screenshot_tool_action',
           {
             sessionId: session.session_id,
@@ -682,6 +685,7 @@ export function CaptureOverlay() {
         );
         if (serial === actionSerial.current && value.text !== undefined)
           setResult({ text: value.text, translated: value.translated });
+        if (serial === actionSerial.current && value.codes !== undefined) setQrCodes(value.codes);
       } catch (e) {
         if (serial === actionSerial.current && !String(e).includes('cancel')) setError(String(e));
       } finally {
@@ -736,7 +740,7 @@ export function CaptureOverlay() {
     else if (action === 'confirm' || action === 'copy') void handleConfirm(true, false);
     else if (action === 'pin') void handleConfirm(false, true);
     else if (action === 'next_candidate') handleCycleCandidate();
-    else if (action === 'ocr' || action === 'translate' || action === 'save')
+    else if (action === 'ocr' || action === 'translate' || action === 'save' || action === 'qr')
       void handleToolAction(action);
     else if ((action === 'edit' || action === 'watermark') && session) {
       setBusy(true);
@@ -763,12 +767,16 @@ export function CaptureOverlay() {
       selection &&
       selection.w > 4 &&
       selection.h > 4 &&
-      ['ocr', 'translate', 'scroll', 'record'].includes(session?.intent ?? '')
+      ['ocr', 'translate', 'scroll', 'record', 'qr'].includes(session?.intent ?? '')
     ) {
       autoHandled.current = true;
       if (session?.intent === 'scroll' || session?.intent === 'record')
         void launchRegionWorkflow(session.intent);
-      else if (session?.intent === 'ocr' || session?.intent === 'translate')
+      else if (
+        session?.intent === 'ocr' ||
+        session?.intent === 'translate' ||
+        session?.intent === 'qr'
+      )
         void handleToolAction(session.intent);
     }
   }, [completedSelection, session, selection, handleToolAction, launchRegionWorkflow]);
@@ -1128,6 +1136,7 @@ export function CaptureOverlay() {
         </div>
       )}
 
+      {qrCodes !== null && <QrResultDialog codes={qrCodes} onClose={() => setQrCodes(null)} />}
       {result && (
         <section
           data-el="capture-result"

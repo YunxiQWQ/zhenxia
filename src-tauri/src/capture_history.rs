@@ -51,9 +51,12 @@ pub async fn choose_image_viewer(app:AppHandle)->Result<Option<String>,String>{
 #[tauri::command]
 pub async fn open_capture_in_viewer(app:AppHandle,db:tauri::State<'_,Arc<Database>>,id:String)->Result<(),String>{
     let path=app.state::<Arc<SettingsManager>>().get().capture.viewer_path;
-    if path.is_empty(){return Err("请先在组件集成中选择图片查看器".into());}
-    let viewer=Path::new(&path);if !viewer.is_file()||viewer.extension().and_then(|x|x.to_str()).map(|x|!x.eq_ignore_ascii_case("exe")).unwrap_or(true){return Err("图片查看器路径无效，请重新选择".into());}
+    let viewer=Path::new(&path);if !path.is_empty()&&(!viewer.is_file()||viewer.extension().and_then(|x|x.to_str()).map(|x|!x.eq_ignore_ascii_case("exe")).unwrap_or(true)){return Err("图片查看器路径无效，请重新选择或移除关联以使用系统默认程序 / Invalid viewer; choose another or reset to the system default".into());}
     let png=image_bytes(&db,&id).await?;let root=exports_root()?;std::fs::create_dir_all(&root).map_err(|e|e.to_string())?;
     let target=root.join(format!("{}.png",uuid::Uuid::new_v4()));std::fs::write(&target,png).map_err(|e|e.to_string())?;
-    std::process::Command::new(viewer).arg(target).spawn().map_err(|e|e.to_string())?;Ok(())
+    if path.is_empty(){
+        use tauri_plugin_opener::OpenerExt;
+        app.opener().open_path(target.to_string_lossy(),None::<&str>).map_err(|e|e.to_string())?;
+    }else{std::process::Command::new(viewer).arg(target).spawn().map_err(|e|e.to_string())?;}
+    Ok(())
 }

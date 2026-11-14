@@ -39,6 +39,22 @@ describe('capture preference edits', () => {
   });
 });
 describe('keyboard binding matching', () => {
+  it.each(['·', '`', 'Dead', 'Process'])(
+    'records the physical Ctrl+· key when the IME reports %s',
+    (key) => {
+      const event = {
+        key,
+        code: 'Backquote',
+        ctrlKey: true,
+        altKey: false,
+        shiftKey: false,
+        metaKey: false,
+      };
+      expect(eventShortcut(event)).toBe('Ctrl+Backquote');
+      expect(shortcutMatches(event as KeyboardEvent, 'Ctrl+·')).toBe(true);
+      expect(shortcutMatches(event as KeyboardEvent, 'Ctrl+Backquote')).toBe(true);
+    }
+  );
   it('matches modifier order and physical letter keys in a non-Latin layout', () => {
     const event = {
       key: 'ф',

@@ -65,6 +65,18 @@ const open = async () => {
   return r;
 };
 describe('unified Win+V history keyboard contract', () => {
+  it('pastes directly from a row action while keeping body clicks for details', async () => {
+    const { container } = await open();
+    const row = container.querySelector('[data-clip-id="first"]')!;
+    fireEvent.click(row.querySelector('[aria-label="Paste clip"]')!);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('paste_clip', { id: 'first', plainText: false })
+    );
+    expect(vi.mocked(invoke).mock.calls.some(([c]) => c === 'copy_clip')).toBe(false);
+    expect(container.querySelector('[data-el="history-detail-pane"]')).toHaveClass('hidden');
+    fireEvent.click(row);
+    expect(container.querySelector('[data-el="history-detail-pane"]')).not.toHaveClass('hidden');
+  });
   it('opens settings through the native foreground window route', async () => {
     const { container } = await open();
     fireEvent.click(container.querySelector('button[aria-label="Settings"]')!);

@@ -3,6 +3,15 @@ import { invoke } from '@tauri-apps/api/core';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ShortcutInput } from './ShortcutInput';
 
+it('records Ctrl+· using the physical Backquote code with an active IME', async () => {
+  const changed = vi.fn();
+  render(<ShortcutInput value="F1" defaultValue="F1" label="Capture" onChange={changed} />);
+  fireEvent.click(screen.getByRole('button', { name: /Capture.*快捷键|Capture shortcut/ }));
+  await waitFor(() => expect(screen.getByRole('button', { pressed: true })).toBeInTheDocument());
+  fireEvent.keyDown(window, { key: 'Process', code: 'Backquote', ctrlKey: true });
+  await waitFor(() => expect(changed).toHaveBeenCalledWith('Ctrl+Backquote'));
+});
+
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(async () => () => {}) }));
 afterEach(async () => {
   cleanup();

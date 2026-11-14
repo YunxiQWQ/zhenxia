@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { RotateCcw, X } from 'lucide-react';
 import { useTranslation } from '../../i18n';
-import { eventShortcut } from '../../utils/capturePreferences';
+import { eventShortcut, displayShortcut } from '../../utils/capturePreferences';
 let activeRecorder: { id: string; stop: (next?: string) => Promise<void> } | null = null;
 let recorderQueue: Promise<void> = Promise.resolve();
 function serializeRecorder(action: () => Promise<void>) {
@@ -153,8 +153,8 @@ export function ShortcutInput({
           }}
         >
           {recording
-            ? pending || (zh ? '请按快捷键，Esc 取消' : 'Press keys; Esc cancels')
-            : value || (zh ? '未绑定' : 'Unbound')}
+            ? displayShortcut(pending) || (zh ? '请按快捷键，Esc 取消' : 'Press keys; Esc cancels')
+            : displayShortcut(value) || (zh ? '未绑定' : 'Unbound')}
         </button>
         <button
           type="button"

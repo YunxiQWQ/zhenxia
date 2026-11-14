@@ -3,6 +3,7 @@ import { useTranslation } from '../i18n';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { clsx } from 'clsx';
+import { toast } from 'sonner';
 import { format } from 'date-fns';
 import {
   Check,
@@ -15,6 +16,7 @@ import {
   Pencil,
   Pin,
   ScanText,
+  ScanQrCode,
   StickyNote,
   Trash2,
   Type,
@@ -22,6 +24,7 @@ import {
 import { ClipboardItem } from '../types';
 import { NOTE_CHAR_LIMIT } from '../constants';
 import { ImageTextViewer } from './ImageTextViewer';
+import { QrResultDialog } from './QrResultDialog';
 import {
   contentKind,
   formatBytes,
@@ -110,6 +113,8 @@ export function ClipPreview({
   // Working copy of the recognized text while the scan panel is open.
   const [scanDraft, setScanDraft] = useState<string | null>(null);
   const [scanBusy, setScanBusy] = useState(false);
+  const [qrCodes, setQrCodes] = useState<string[] | null>(null);
+  const [qrBusy, setQrBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   // Local working copy of the note so typing stays responsive; saved on blur.
   const [noteDraft, setNoteDraft] = useState('');
@@ -191,6 +196,7 @@ export function ClipPreview({
     setDraft(null);
     // A correction typed for one image must never be saved onto another.
     setScanDraft(null);
+    setQrCodes(null);
   }, [clipId]);
 
   // Close the panel when the selection moves; a correction typed for one image
@@ -277,7 +283,8 @@ export function ClipPreview({
   const expired = details?.image_expired ?? clip.image_expired ?? false;
 
   return (
-    <div data-el="clip-preview" className="flex h-full min-h-0 flex-col">
+    <div data-el="clip-preview" className="relative flex h-full min-h-0 flex-col">
+      {qrCodes !== null && <QrResultDialog codes={qrCodes} onClose={() => setQrCodes(null)} />}
       {isImage ? (
         <div className="flex min-h-0 flex-1 flex-col px-3 pt-3">
           {imageSrc ? (
@@ -539,6 +546,26 @@ export function ClipPreview({
           >
             <Pencil size={13} />
             Edit image
+          </button>
+        )}
+        {isImage && (
+          <button
+            type="button"
+            className={actionClass}
+            disabled={expired || qrBusy}
+            onClick={() => {
+              const id = clip.id;
+              setQrBusy(true);
+              void invoke<string[]>('scan_clip_qr', { id })
+                .then((codes) => {
+                  if (activeClipIdRef.current === id) setQrCodes(codes);
+                })
+                .catch((e) => toast.error(String(e)))
+                .finally(() => setQrBusy(false));
+            }}
+          >
+            <ScanQrCode size={13} />
+            {lang === 'zh-CN' ? '扫一扫' : 'Scan QR code'}
           </button>
         )}
         {isImage && onPinImage && (

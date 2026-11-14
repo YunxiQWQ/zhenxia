@@ -4,8 +4,11 @@ mod capture_preferences;
 mod capture_history;
 mod workflows;
 mod scroll_stitch;
+mod scroll_control;
 mod record_encoder;
+mod record_capture;
 mod components;
+mod qr_scan;
 mod local_ocr;
 mod offline_translate;
 mod tray_menu;
@@ -375,6 +378,7 @@ pub fn run_app() {
                 .on_menu_event(move |app, event| {
                     if event.id.as_ref()=="scroll"||event.id.as_ref()=="record" {let kind=event.id.as_ref().to_string();let handle=app.clone();tauri::async_runtime::spawn(async move{let _=workflows::start_workflow_capture(handle,kind).await;});}
                     else if event.id.as_ref()=="presentation" {let handle=app.clone();tauri::async_runtime::spawn(async move{let _=workflows::start_presentation(handle).await;});}
+                    else if event.id.as_ref()=="scan_qr" {let handle=app.clone();tauri::async_runtime::spawn(async move{let _=qr_scan::start_qr_capture(handle).await;});}
                     else if event.id.as_ref()=="workflow" {if !workflows::available(){let _=workflows::show_controls(app);}}
                     else if event.id.as_ref() == "quit" {
                         app.exit(0);
@@ -615,6 +619,9 @@ pub fn run_app() {
             commands::open_settings_section,
             commands::open_translation_window,
             zhenxia::screenshot_tool_action,
+            qr_scan::scan_qr_image,
+            qr_scan::scan_clip_qr,
+            qr_scan::start_qr_capture,
             capture_history::list_capture_history,
             capture_history::clear_capture_history,
             capture_history::open_capture_history_directory,
@@ -659,6 +666,7 @@ pub fn run_app() {
             shortcuts::get_hotkey_startup_notice,
             zhenxia::start_screenshot,
             workflows::start_region_workflow,
+            workflows::set_scroll_driving,
             workflows::start_workflow_capture,
             workflows::workflow_status,
             workflows::sample_scroll,

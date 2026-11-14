@@ -35,6 +35,7 @@ export function FeatureLauncher({ active = true }: { active?: boolean }) {
           label={text('截图工具', 'Capture tools')}
           onClose={() => setMenu(null)}
           options={[
+            { id: 'qr', cn: '扫一扫', en: 'Scan QR code' },
             { id: 'scroll', cn: '长截图', en: 'Scrolling capture' },
             { id: 'record', cn: '录屏', en: 'Screen recording' },
             { id: 'presentation', cn: '演示画布 / 恢复操作', en: 'Presentation / restore' },
@@ -42,8 +43,12 @@ export function FeatureLauncher({ active = true }: { active?: boolean }) {
             label: text(cn, en),
             onClick: () => {
               void invoke(
-                id === 'presentation' ? 'start_presentation' : 'start_workflow_capture',
-                id === 'presentation' ? {} : { kind: id }
+                id === 'presentation'
+                  ? 'start_presentation'
+                  : id === 'qr'
+                    ? 'start_qr_capture'
+                    : 'start_workflow_capture',
+                id === 'presentation' || id === 'qr' ? {} : { kind: id }
               ).catch((e) => toast.error(String(e)));
             },
           }))}

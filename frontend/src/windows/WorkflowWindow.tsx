@@ -10,6 +10,8 @@ interface Status {
   frames?: number;
   preview?: string;
   auto?: boolean;
+  driving?: boolean;
+  canAutoScroll?: boolean;
   canUndo?: boolean;
   message?: string;
   started?: boolean;
@@ -24,8 +26,10 @@ export function WorkflowWindow() {
     [error, setError] = useState(''),
     [busy, setBusy] = useState(false),
     [format, setFormat] = useState('mp4'),
-    [fps, setFps] = useState(12);
-  useEffect(()=>{void invoke('workflow_ready').catch(e=>setError(String(e)))},[]);
+    [fps, setFps] = useState(30);
+  useEffect(() => {
+    void invoke('workflow_ready').catch((e) => setError(String(e)));
+  }, []);
   useEffect(() => {
     let alive = true,
       pending = false;
@@ -116,6 +120,18 @@ export function WorkflowWindow() {
             />
             {t('自动采集', 'Capture automatically')}
           </label>
+          <label className="mb-2 flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={status.driving ?? false}
+              disabled={busy || !status.canAutoScroll}
+              onChange={(e) => void run('set_scroll_driving', { enabled: e.target.checked })}
+            />
+            {t(
+              '自动滚动原页面（鼠标移出选区即暂停）',
+              'Auto-scroll source (leave the region to pause)'
+            )}
+          </label>
           <button
             className="self-start text-xs underline disabled:opacity-40"
             disabled={busy || !status.canUndo}
@@ -157,7 +173,10 @@ export function WorkflowWindow() {
                 <select
                   className="rounded border border-border bg-background p-2"
                   value={format}
-                  onChange={(e) => setFormat(e.target.value)}
+                  onChange={(e) => {
+                    setFormat(e.target.value);
+                    setFps(e.target.value === 'gif' ? 12 : 30);
+                  }}
                 >
                   <option>mp4</option>
                   <option>gif</option>

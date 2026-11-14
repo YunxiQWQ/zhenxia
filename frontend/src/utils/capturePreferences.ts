@@ -16,6 +16,7 @@ export const CAPTURE_ACTIONS = [
   ['edit', '完整编辑', 'Full editor'],
   ['ocr', '识别文字', 'Recognize text'],
   ['translate', '翻译', 'Translate'],
+  ['qr', '扫一扫', 'Scan QR code'],
   ['save', '保存图片', 'Save image'],
   ['pin', '贴图', 'Pin image'],
   ['scroll', '长截图', 'Scrolling capture'],
@@ -96,6 +97,7 @@ export const DEFAULT_CAPTURE_PREFERENCES: CapturePreferences = {
     scroll: '',
     record: '',
     watermark: '',
+    qr: '',
   },
   global_hotkeys: {},
   ocr_engine: 'windows',
@@ -108,18 +110,19 @@ export const DEFAULT_CAPTURE_PREFERENCES: CapturePreferences = {
 };
 export function capturePreferences(settings?: Settings | null): CapturePreferences {
   const p = settings?.capture;
+  const order = [...(p?.toolbar_order ?? DEFAULT_CAPTURE_PREFERENCES.toolbar_order)];
+  for (const [action] of CAPTURE_ACTIONS) {
+    if (order.includes(action)) continue;
+    const end = order.findIndex((id) => id === 'cancel' || id === 'confirm');
+    order.splice(end < 0 ? order.length : end, 0, action);
+  }
   return {
     ...DEFAULT_CAPTURE_PREFERENCES,
     ...p,
     toolbar_colors: { ...DEFAULT_CAPTURE_PREFERENCES.toolbar_colors, ...p?.toolbar_colors },
     shortcuts: { ...DEFAULT_CAPTURE_PREFERENCES.shortcuts, ...p?.shortcuts },
     global_hotkeys: p?.global_hotkeys ?? {},
-    toolbar_order: [
-      ...new Set([
-        ...(p?.toolbar_order ?? DEFAULT_CAPTURE_PREFERENCES.toolbar_order),
-        ...CAPTURE_ACTIONS.map((a) => a[0]),
-      ]),
-    ],
+    toolbar_order: [...new Set(order)],
   };
 }
 
@@ -155,6 +158,23 @@ export function mergeCaptureUpdate(
 export function eventShortcut(
   event: Pick<KeyboardEvent, 'key' | 'code' | 'ctrlKey' | 'altKey' | 'shiftKey' | 'metaKey'>
 ): string | null {
+  // IMEs can report `·`, `Dead` or `Process` for the same OEM key.
+  // Persist its physical code so recording and RegisterHotKey agree.
+  const punctuation = [
+    'Backquote',
+    'Minus',
+    'Equal',
+    'BracketLeft',
+    'BracketRight',
+    'Backslash',
+    'Semicolon',
+    'Quote',
+    'Comma',
+    'Period',
+    'Slash',
+    'IntlBackslash',
+  ];
+  const physical = punctuation.includes(event.code);
   if (
     [
       'Control',
@@ -166,7 +186,8 @@ export function eventShortcut(
       'Dead',
       'Process',
       'Unidentified',
-    ].includes(event.key)
+    ].includes(event.key) &&
+    !physical
   )
     return null;
   const parts = [];
@@ -175,13 +196,20 @@ export function eventShortcut(
   if (event.shiftKey) parts.push('Shift');
   if (event.metaKey) parts.push('Win');
   let key = event.key;
-  if (event.code?.startsWith('Key')) key = event.code.slice(3);
+  if (physical) key = event.code;
+  else if (event.code?.startsWith('Key')) key = event.code.slice(3);
   else if (event.code?.startsWith('Digit')) key = event.code.slice(5);
   else if (key === ' ') key = 'Space';
   else if (key.length === 1) key = key.toUpperCase();
   if (['+', '=', '-', '/', '\\', ',', '.', ';', "'", '[', ']', '`'].includes(key)) key = event.code;
   parts.push(key);
   return parts.join('+');
+}
+export function displayShortcut(value: string): string {
+  return value
+    .split('+')
+    .map((key) => (key === 'Backquote' ? '·' : key))
+    .join('+');
 }
 export function shortcutMatches(event: KeyboardEvent, value?: string): boolean {
   if (!value) return false;
@@ -191,7 +219,8 @@ export function shortcutMatches(event: KeyboardEvent, value?: string): boolean {
       .replace(/windows|super|meta/g, 'win')
       .replace(/control/g, 'ctrl')
       .split('+');
-    const key = tokens.pop();
+    const last = tokens.pop();
+    const key = ['·', '`', '~'].includes(last ?? '') ? 'backquote' : last;
     return [...tokens.sort(), key].join('+');
   };
   return normalize(eventShortcut(event) ?? '') === normalize(value);

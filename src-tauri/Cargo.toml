@@ -1,6 +1,6 @@
 [package]
 name = "cubby"
-version = "0.2.2"
+version = "0.2.3"
 description = "A native-feeling clipboard history replacement for Windows 11"
 authors = ["SouthForge AI", "PastePaw contributors"]
 license = "GPL-3.0-only"
@@ -67,6 +67,7 @@ lscreen-capture = { path = "engines/lscreen-capture" }
 
 
 [target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "=2.0.1"
 webview2-com = "0.39.1"
 # Match clipboard-rs' decoder and RGBA PNG encoder so moving reads to OLE does
 # not change bitmap pixels, encoded content hashes, or cross-version dedup.

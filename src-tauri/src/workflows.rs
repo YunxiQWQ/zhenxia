@@ -7,8 +7,8 @@ use image::RgbaImage;
 use crate::{database::Database,scroll_stitch::ScrollStitch};
 
 #[derive(Clone,Copy,Deserialize,Serialize)]pub struct Region{pub x:i32,pub y:i32,pub width:u32,pub height:u32}
-struct Scroll{ id:String,region:Region,stitch:ScrollStitch,message:String,auto:bool,revision:u64 }
-struct Recording{stop:AtomicBool,cancel:AtomicBool,pause:AtomicBool,frames:AtomicU64,elapsed:AtomicU64,done:AtomicBool,worker:Mutex<Option<std::thread::JoinHandle<Result<RawVideo,String>>>>,region:Region,format:String,result:Mutex<Option<Arc<RawVideo>>>}
+struct Scroll{ id:String,region:Region,stitch:ScrollStitch,message:String,auto:bool,revision:u64,driving:bool,armed:Instant,target:Option<crate::scroll_control::Target>,unchanged:u32 }
+struct Recording{stop:AtomicBool,cancel:AtomicBool,pause:AtomicBool,frames:AtomicU64,elapsed:AtomicU64,done:AtomicBool,worker:Mutex<Option<std::thread::JoinHandle<Result<RawVideo,String>>>>,region:Region,format:String,backend:Mutex<String>,result:Mutex<Option<Arc<RawVideo>>>}
 struct RawVideo{path:PathBuf,thumbnail:Vec<u8>,duration:u64}
 impl Drop for RawVideo{fn drop(&mut self){let _=std::fs::remove_file(&self.path);}}
 enum Session{Scroll(Scroll),Record(Arc<Recording>)}
@@ -27,12 +27,12 @@ pub async fn start_region_workflow(app:AppHandle,kind:String,region:Region)->Res
     let kind_copy=kind.clone();
     tauri::async_runtime::spawn_blocking(move||->Result<(),String>{
         let mut guard=session().lock().unwrap();if guard.is_some(){return Err("A capture is already active".into());}
-        if kind_copy=="scroll"{*guard=Some(Session::Scroll(Scroll{id:uuid::Uuid::new_v4().to_string(),region,stitch:ScrollStitch::new(capture(region)?)?,message:String::new(),auto:true,revision:0}));}
-        else if kind_copy=="record"{*guard=Some(Session::Record(Arc::new(Recording{stop:AtomicBool::new(false),cancel:AtomicBool::new(false),pause:AtomicBool::new(false),frames:AtomicU64::new(0),elapsed:AtomicU64::new(0),done:AtomicBool::new(false),worker:Mutex::new(None),region,format:String::new(),result:Mutex::new(None)})));}
+        if kind_copy=="scroll"{*guard=Some(Session::Scroll(Scroll{id:uuid::Uuid::new_v4().to_string(),region,stitch:ScrollStitch::new(capture(region)?)?,message:String::new(),auto:true,revision:0,driving:false,armed:Instant::now(),target:crate::scroll_control::target(region),unchanged:0}));}
+        else if kind_copy=="record"{*guard=Some(Session::Record(Arc::new(Recording{stop:AtomicBool::new(false),cancel:AtomicBool::new(false),pause:AtomicBool::new(false),frames:AtomicU64::new(0),elapsed:AtomicU64::new(0),done:AtomicBool::new(false),worker:Mutex::new(None),region,format:String::new(),backend:Mutex::new(String::new()),result:Mutex::new(None)})));}
         else{return Err("Unknown capture mode".into());}Ok(())
     }).await.map_err(|e|e.to_string())??;
     if let Err(error)=show_controls(&app){cancel_active();return Err(error);}
-    if kind=="scroll"{let id={let guard=session().lock().unwrap();match guard.as_ref(){Some(Session::Scroll(s))=>s.id.clone(),_=>return Err("Capture ended".into())}};std::thread::spawn(move||{loop{std::thread::sleep(Duration::from_millis(700));let active={let g=session().lock().unwrap();match g.as_ref(){Some(Session::Scroll(s)) if s.id==id=>Some(s.auto),_=>None}};match active{Some(true)=>{let _=sample_inner();},Some(false)=>{},None=>break}}});}
+    if kind=="scroll"{let id={let guard=session().lock().unwrap();match guard.as_ref(){Some(Session::Scroll(s))=>s.id.clone(),_=>return Err("Capture ended".into())}};std::thread::spawn(move||{loop{std::thread::sleep(Duration::from_millis(700));let active={let g=session().lock().unwrap();match g.as_ref(){Some(Session::Scroll(s)) if s.id==id=>Some(s.auto),_=>None}};match active{Some(true)=>{match drive_scroll(){Ok(true)=>std::thread::sleep(Duration::from_millis(250)),Ok(false)=>{},Err(_)=>continue}let _=sample_inner();},Some(false)=>{},None=>break}}});}
     Ok(())
 }
 pub(crate) fn show_controls(app:&AppHandle)->Result<(),String>{
@@ -48,18 +48,43 @@ pub fn cancel_active(){let mut guard=session().lock().unwrap();if let Some(Sessi
 fn sample_inner()->Result<bool,String>{
     let (id,region,revision)={let g=session().lock().unwrap();match g.as_ref(){Some(Session::Scroll(s))=>(s.id.clone(),s.region,s.revision),_=>return Err("No scrolling capture".into())}};
     let frame=capture(region)?;let mut g=session().lock().unwrap();let Some(Session::Scroll(s))=g.as_mut() else{return Err("Capture ended".into())};if s.id!=id||s.revision!=revision{return Err("Capture changed".into());}
-    match s.stitch.append(frame){Ok(changed)=>{s.message=if changed{String::new()}else{"向下滚动页面，保持至少一半重叠 / Scroll down, keeping half the region overlapping".into()};Ok(changed)},Err(e)=>{s.message=e.clone();Err(e)}}
+    match s.stitch.append(frame){
+        Ok(changed)=>{
+            if changed{s.unchanged=0;s.message=String::new();}
+            else if s.driving&&s.armed.elapsed()>Duration::from_secs(2){s.unchanged+=1;if s.unchanged>=3{s.driving=false;s.auto=false;s.message="已暂停：到底或页面未变化，可完成保存 / Paused: end reached or page unchanged; finish to save".into();}}
+            else{s.message="向下滚动页面，保持至少一半重叠 / Scroll down, keeping half the region overlapping".into();}
+            Ok(changed)
+        },
+        Err(e)=>{s.message=e.clone();s.auto=false;s.driving=false;s.revision+=1;Err(e)}
+    }
 }
 #[tauri::command]pub async fn sample_scroll()->Result<bool,String>{tauri::async_runtime::spawn_blocking(sample_inner).await.map_err(|e|e.to_string())?}
-#[tauri::command]pub fn set_scroll_auto(enabled:bool){if let Some(Session::Scroll(s))=session().lock().unwrap().as_mut(){s.auto=enabled;s.revision+=1;}}
-#[tauri::command]pub fn undo_scroll()->bool{if let Some(Session::Scroll(s))=session().lock().unwrap().as_mut(){s.auto=false;s.revision+=1;s.message="已撤销，自动采集已暂停 / Undone; automatic capture paused".into();return s.stitch.undo();}false}
+#[tauri::command]pub fn set_scroll_auto(enabled:bool){if let Some(Session::Scroll(s))=session().lock().unwrap().as_mut(){s.auto=enabled;if !enabled{s.driving=false;}s.revision+=1;}}
+
+#[tauri::command]
+pub fn set_scroll_driving(enabled:bool)->Result<(),String>{
+    let mut guard=session().lock().unwrap();let Some(Session::Scroll(s))=guard.as_mut()else{return Err("No scrolling capture".into())};
+    if enabled&&s.target.is_none(){return Err("未找到可滚动的原窗口，请使用手动滚动 / Use manual scrolling for this region".into());}
+    s.driving=enabled;s.armed=Instant::now();s.unchanged=0;s.revision+=1;
+    if enabled{s.auto=true;s.message="两秒后开始，请把鼠标移入选区；移出即暂停 / Starts in two seconds; move the pointer into the region. Leaving pauses scrolling".into();}
+    else{s.message=String::new();}
+    Ok(())
+}
+fn drive_scroll()->Result<bool,String>{
+    let mut guard=session().lock().unwrap();let Some(Session::Scroll(s))=guard.as_mut()else{return Ok(false)};
+    if !s.driving||s.armed.elapsed()<Duration::from_secs(2){return Ok(false);}
+    let Some(target)=s.target else{return Ok(false)};
+    match crate::scroll_control::step(target,s.region){Ok(())=>Ok(true),Err(error)=>{s.driving=false;s.auto=false;s.revision+=1;s.message=error.clone();Err(error)}}
+}
+
+#[tauri::command]pub fn undo_scroll()->bool{if let Some(Session::Scroll(s))=session().lock().unwrap().as_mut(){s.auto=false;s.driving=false;s.revision+=1;s.message="已撤销，自动采集已暂停 / Undone; automatic capture paused".into();return s.stitch.undo();}false}
 #[tauri::command]pub async fn workflow_status()->Result<serde_json::Value,String>{
     let g=session().lock().unwrap();Ok(match g.as_ref(){
-        Some(Session::Scroll(s))=>serde_json::json!({"kind":"scroll","width":s.stitch.width,"height":s.stitch.height,"frames":s.stitch.frames,"auto":s.auto,"canUndo":s.stitch.can_undo(),"message":s.message,"preview":format!("data:image/png;base64,{}",B64.encode(png(&s.stitch.preview())?))}),
-        Some(Session::Record(r))=>serde_json::json!({"kind":"record","width":r.region.width,"height":r.region.height,"frames":r.frames.load(Ordering::Acquire),"elapsed":r.elapsed.load(Ordering::Acquire),"paused":r.pause.load(Ordering::Acquire),"done":r.done.load(Ordering::Acquire),"started":r.worker.lock().unwrap().is_some()||r.result.lock().unwrap().is_some(),"format":r.format}),None=>serde_json::json!({"kind":"none"})})
+        Some(Session::Scroll(s))=>serde_json::json!({"kind":"scroll","width":s.stitch.width,"height":s.stitch.height,"frames":s.stitch.frames,"auto":s.auto,"driving":s.driving,"canAutoScroll":s.target.is_some(),"canUndo":s.stitch.can_undo(),"message":s.message,"preview":format!("data:image/png;base64,{}",B64.encode(png(&s.stitch.preview())?))}),
+        Some(Session::Record(r))=>serde_json::json!({"kind":"record","width":r.region.width,"height":r.region.height,"frames":r.frames.load(Ordering::Acquire),"elapsed":r.elapsed.load(Ordering::Acquire),"paused":r.pause.load(Ordering::Acquire),"done":r.done.load(Ordering::Acquire),"started":r.worker.lock().unwrap().is_some()||r.result.lock().unwrap().is_some(),"format":r.format,"backend":r.backend.lock().unwrap().clone()}),None=>serde_json::json!({"kind":"none"})})
 }
 #[tauri::command]pub async fn finish_scroll(app:AppHandle,db:tauri::State<'_,Arc<Database>>)->Result<String,String>{
-    let (id,image)={let mut guard=session().lock().unwrap();match guard.as_mut(){Some(Session::Scroll(s))=>{s.auto=false;s.revision+=1;(s.id.clone(),s.stitch.image())},_=>return Err("No scrolling capture".into())}};
+    let (id,image)={let mut guard=session().lock().unwrap();match guard.as_mut(){Some(Session::Scroll(s))=>{s.auto=false;s.driving=false;s.revision+=1;(s.id.clone(),s.stitch.image())},_=>return Err("No scrolling capture".into())}};
     let bytes=tauri::async_runtime::spawn_blocking(move||png(&image)).await.map_err(|e|e.to_string())??;
     let stored=crate::zhenxia::insert_image_history(&app,&db,&bytes,serde_json::json!({"kind":"screenshot","source":"zhenxia","mode":"scroll"}),false).await?;
     {let mut g=session().lock().unwrap();if matches!(g.as_ref(),Some(Session::Scroll(s)) if s.id==id){*g=None;}}
@@ -73,20 +98,20 @@ fn sample_inner()->Result<bool,String>{
     if old.worker.lock().unwrap().is_some(){return Err("Recording already started".into());}
     let mut region=old.region;region.width&=!1;region.height&=!1;
     if format=="gif"&&region.width as u64*region.height as u64>2_100_000{return Err("GIF请选择210万像素以内的区域，大区域请用MP4 / Use MP4 for larger regions".into());}
-    let control=Arc::new(Recording{region,format:format.clone(),result:Mutex::new(None),stop:AtomicBool::new(false),cancel:AtomicBool::new(false),pause:AtomicBool::new(false),frames:AtomicU64::new(0),elapsed:AtomicU64::new(0),done:AtomicBool::new(false),worker:Mutex::new(None)});
+    let control=Arc::new(Recording{region,format:format.clone(),backend:Mutex::new(String::new()),result:Mutex::new(None),stop:AtomicBool::new(false),cancel:AtomicBool::new(false),pause:AtomicBool::new(false),frames:AtomicU64::new(0),elapsed:AtomicU64::new(0),done:AtomicBool::new(false),worker:Mutex::new(None)});
     let output=root()?.join(format!("active-{}.{}",uuid::Uuid::new_v4(),format));let c=control.clone();
     let worker=std::thread::spawn(move||{let result=record_loop(&c,&output,&format,fps);c.done.store(true,Ordering::Release);if result.is_err(){let _=std::fs::remove_file(&output);}result});
     *control.worker.lock().unwrap()=Some(worker);*g=Some(Session::Record(control));Ok(())
 }
 fn record_loop(c:&Recording,path:&Path,format:&str,fps:u32)->Result<RawVideo,String>{
-    let first=capture(c.region)?;let thumbnail=png(&image::imageops::thumbnail(&first,320,200))?;let mut encoder=crate::record_encoder::Encoder::new(path,format,c.region.width,c.region.height,fps)?;
+    let (mut source,backend)=crate::record_capture::Frames::new(c.region,fps);*c.backend.lock().unwrap()=backend.into();let first=source.frame()?;let thumbnail=png(&image::imageops::thumbnail(&first,320,200))?;let mut encoder=crate::record_encoder::Encoder::new(path,format,c.region.width,c.region.height,fps)?;
     let period=Duration::from_micros(1_000_000/fps as u64);let mut elapsed=Duration::ZERO;let mut last_tick=Instant::now();
     loop{
         if c.stop.load(Ordering::Acquire){break;}
-        if c.pause.load(Ordering::Acquire){std::thread::sleep(Duration::from_millis(80));last_tick=Instant::now();continue;}
-        let tick=Instant::now();let step=tick.duration_since(last_tick);elapsed+=step;last_tick=tick;
+        if c.pause.load(Ordering::Acquire){source.pause(true);std::thread::sleep(Duration::from_millis(80));last_tick=Instant::now();continue;}
+        source.pause(false);let tick=Instant::now();let step=tick.duration_since(last_tick);elapsed+=step;last_tick=tick;
         let duration=if format=="gif"{period.max(step)}else{period};
-        encoder.frame(capture(c.region)?,elapsed.as_nanos() as u64/100,duration.as_nanos() as u64/100)?;
+        encoder.frame(source.frame()?,elapsed.as_nanos() as u64/100,duration.as_nanos() as u64/100)?;
         c.frames.fetch_add(1,Ordering::AcqRel);c.elapsed.store(elapsed.as_millis() as u64,Ordering::Release);
         if elapsed>Duration::from_secs(1800)||std::fs::metadata(path).map(|m|m.len()>512*1024*1024).unwrap_or(false){break;}
         if let Some(wait)=period.checked_sub(tick.elapsed()){std::thread::sleep(wait);}
