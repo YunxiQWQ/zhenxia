@@ -2,7 +2,7 @@
 
 Windows 剪贴板历史、截图与标注工具。以 Cubby 为主体，整合 LaterScreen Rust 引擎，并参考轻雪的截图与贴图工作流。
 
-**当前版本：0.2.4。** 支持中文和英文。[更新说明](docs/RELEASE-0.2.4.md)。项目仍在完善，已有功能不代表与轻雪的全部能力一致。
+**当前版本：0.2.4。** 支持中文和英文。[更新说明](https://github.com/YunxiQWQ/zhenxia/blob/main/docs/RELEASE-0.2.4.md)。项目仍在完善，已有功能不代表与轻雪的全部能力一致。
 
 ## 下载与运行
 
