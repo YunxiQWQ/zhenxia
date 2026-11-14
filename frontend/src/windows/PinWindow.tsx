@@ -124,7 +124,7 @@ export function PinWindow() {
           draggable={false}
           className="h-full w-full object-contain"
           onMouseDown={(e) => {
-            if (e.button === 0) void getCurrentWindow().startDragging();
+            if (e.button === 0) void invoke('start_window_drag');
           }}
         />
       ) : (

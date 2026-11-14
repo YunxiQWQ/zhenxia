@@ -2792,7 +2792,7 @@ pub async fn open_settings_window(app: AppHandle) -> Result<(), String> {
     else {
         let builder = tauri::WebviewWindowBuilder::new(&app, "settings", tauri::WebviewUrl::App("index.html?window=settings".into()))
             .title("帧匣 · 设置").inner_size(800., 700.).resizable(true)
-            .decorations(false).transparent(true).shadow(false).center().visible(false)
+            .decorations(false).minimizable(false).maximizable(false).transparent(true).shadow(false).center().visible(false)
             // WebView2 HTML drag/drop must receive the native OLE events itself.
             .disable_drag_drop_handler();
         #[cfg(target_os = "windows")]
@@ -2808,6 +2808,7 @@ pub async fn open_settings_window(app: AppHandle) -> Result<(), String> {
     };
     crate::apply_window_effect(&settings, &preferences.mica_effect, &theme, preferences.round_corners);
     let _ = settings.unminimize();
+    crate::window_presentation::refresh_shape_before_show(&settings).await?;
     crate::window_presentation::show(&settings)
 }
 
@@ -2825,10 +2826,10 @@ pub async fn open_settings_section(app:AppHandle,section:String)->Result<(),Stri
 pub async fn open_translation_window(app:AppHandle)->Result<(),String>{
     if crate::zhenxia::capture_active(){return Err("Finish the current capture first".into());}
     let window=if let Some(window)=app.get_webview_window("translation"){window}else{
-        tauri::WebviewWindowBuilder::new(&app,"translation",tauri::WebviewUrl::App("index.html?window=translation".into())).title("帧匣 · 离线翻译").inner_size(740.,620.).decorations(false).transparent(true).visible(false).build().map_err(|e|e.to_string())?
+        tauri::WebviewWindowBuilder::new(&app,"translation",tauri::WebviewUrl::App("index.html?window=translation".into())).title("帧匣 · 离线翻译").inner_size(740.,620.).decorations(false).minimizable(false).maximizable(false).transparent(true).visible(false).build().map_err(|e|e.to_string())?
     };
     let p=app.state::<Arc<crate::settings_manager::SettingsManager>>().get();let theme=if p.theme=="dark"{tauri::Theme::Dark}else if p.theme=="light"{tauri::Theme::Light}else{window.theme().unwrap_or(tauri::Theme::Light)};
-    crate::apply_window_effect(&window,&p.mica_effect,&theme,p.round_corners);crate::window_presentation::show(&window)
+    crate::apply_window_effect(&window,&p.mica_effect,&theme,p.round_corners);crate::window_presentation::refresh_shape_before_show(&window).await?;crate::window_presentation::show(&window)
 }
 
 /// Hiding an already-unfocused window need not emit another blur event.
@@ -2865,6 +2866,7 @@ pub async fn open_image_window(app: AppHandle, id: String) -> Result<(), String>
         if let Err(e) = window.unminimize() {
             log::warn!("Failed to unminimize the image window: {:?}", e);
         }
+        crate::window_presentation::refresh_shape_before_show(&window).await?;
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
         return Ok(());
@@ -2882,17 +2884,20 @@ pub async fn open_image_window(app: AppHandle, id: String) -> Result<(), String>
         })
         .unwrap_or((1280.0, 860.0));
 
-    tauri::WebviewWindowBuilder::new(&app, IMAGE_WINDOW_LABEL, tauri::WebviewUrl::App(url.into()))
-        .title("Cubby Image")
+    let window=tauri::WebviewWindowBuilder::new(&app, IMAGE_WINDOW_LABEL, tauri::WebviewUrl::App(url.into()))
+        .title("帧匣 · 查看图片")
+        .shadow(false)
         .inner_size(width, height)
         .min_inner_size(520.0, 400.0)
         .resizable(true)
-        .decorations(false)
+        .decorations(false).minimizable(false).maximizable(false)
         .transparent(false)
+        .visible(false)
         .center()
         .build()
         .map_err(|e| e.to_string())?;
-
+    crate::window_presentation::refresh_shape_before_show(&window).await?;
+    crate::window_presentation::show(&window)?;
     Ok(())
 }
 

@@ -31,7 +31,7 @@ export function TranslationWindow() {
         className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3"
         onMouseDown={(e) => {
           if (e.button === 0 && !(e.target as Element).closest('button'))
-            void getCurrentWindow().startDragging();
+            void invoke('start_window_drag');
         }}
       >
         <span className="text-sm font-medium">

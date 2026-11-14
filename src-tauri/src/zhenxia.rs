@@ -696,6 +696,7 @@ pub async fn present_capture(window: tauri::WebviewWindow, session_id: String) -
     if window.label() != OVERLAY_LABEL { return Err("Unexpected capture window".into()); }
     let elapsed = desktop_sessions().lock().unwrap().get(&session_id)
         .ok_or_else(|| "Screenshot session expired".to_string())?.started.elapsed().as_millis();
+    crate::window_presentation::refresh_shape_before_show(&window).await?;
     crate::window_presentation::show(&window)?;
     log::info!("CAPTURE_TIMING: visible_ms={elapsed}");
     Ok(())
@@ -846,7 +847,7 @@ pub async fn finish_screenshot(
 
     let mut result = insert_image_history(&app, &db, &png, metadata, copy_to_clipboard).await?;
     if pin {
-        pin_png(&app, &png)?;
+        pin_png(&app, &png).await?;
         result.pinned = true;
     }
     Ok(result)
@@ -933,6 +934,34 @@ pub fn close_screenshot_window(app: &AppHandle) {
     }
 }
 
+pub(crate) fn workflow_region(session_id: &str, crop: &CropRegion) -> Result<crate::workflows::Region, String> {
+    let sessions = desktop_sessions().lock().unwrap();
+    let session = sessions.get(session_id).filter(|s| !s.is_edit).ok_or("Screenshot session expired")?;
+    if ![crop.x, crop.y, crop.width, crop.height].iter().all(|n| n.is_finite())
+        || crop.x < 0.0 || crop.y < 0.0 || crop.width < 32.0 || crop.height < 96.0
+        || crop.x + crop.width > session.width as f32 + 0.5 || crop.y + crop.height > session.height as f32 + 0.5 {
+        return Err("请选择有效的滚动或录屏区域 / Invalid capture region".into());
+    }
+    Ok(crate::workflows::Region {
+        x: session.origin_x.checked_add(crop.x.round() as i32).ok_or("Invalid region origin")?,
+        y: session.origin_y.checked_add(crop.y.round() as i32).ok_or("Invalid region origin")?,
+        width: crop.width.round() as u32,
+        height: crop.height.round() as u32,
+    })
+}
+
+/// Transfer the settings restore request instead of flashing settings over the
+/// source between region selection and the first scrolling/recording sample.
+pub(crate) fn detach_capture_for_workflow(app: &AppHandle) -> bool {
+    let restore = RESTORE_SETTINGS.swap(false, Ordering::AcqRel);
+    close_screenshot_window(app);
+    restore
+}
+
+pub(crate) fn restore_settings_when_editor_closes(restore: bool) {
+    if restore { RESTORE_SETTINGS.store(true, Ordering::Release); }
+}
+
 fn suspend_settings(app: &AppHandle) {
     if let Some(settings) = app.get_webview_window("settings") {
         if settings.is_visible().unwrap_or(false) {
@@ -942,7 +971,7 @@ fn suspend_settings(app: &AppHandle) {
     }
 }
 
-fn pin_png(app: &AppHandle, png: &[u8]) -> Result<String, String> {
+async fn pin_png(app: &AppHandle, png: &[u8]) -> Result<String, String> {
     let image = image::load_from_memory(png).map_err(|error| error.to_string())?;
     let (width, height) = image.dimensions();
     let id = Uuid::new_v4().to_string();
@@ -963,18 +992,21 @@ fn pin_png(app: &AppHandle, png: &[u8]) -> Result<String, String> {
     let label = format!("{PIN_PREFIX}{id}");
     let url = format!("index.html?window=pin&pin={id}");
 
-    WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+    let window = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
         .title("帧匣贴图")
         .shadow(false)
         .inner_size(win_w, win_h)
         .position(cursor_x as f64 / scale as f64, cursor_y as f64 / scale as f64)
-        .decorations(false)
+        .decorations(false).minimizable(false).maximizable(false)
         .transparent(true)
+        .visible(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(true)
         .build()
         .map_err(|error| { pin_payloads().lock().unwrap().remove(&id); error.to_string() })?;
+    crate::window_presentation::refresh_shape_before_show(&window).await?;
+    crate::window_presentation::show(&window)?;
     Ok(id)
 }
 
@@ -1047,7 +1079,7 @@ pub async fn export_image_edit(
         "session_id":session_id, "parent_clip_id":parent, "renderer":"canvas-editor"
     });
     insert_image_history(&app, &db, &png, metadata, action == "copy").await?;
-    if action == "pin" { pin_png(&app, &png)?; }
+    if action == "pin" { pin_png(&app, &png).await?; }
     Ok(())
 }
 
@@ -1119,7 +1151,7 @@ pub async fn pin_clipboard_image(app: AppHandle) -> Result<String, String> {
         .map_err(|error| error.to_string())?
         .get_bytes()
         .to_vec();
-    pin_png(&app, &png)
+    pin_png(&app, &png).await
 }
 
 #[tauri::command]
@@ -1138,7 +1170,7 @@ pub async fn pin_clip_image(
     let path = path.ok_or_else(|| "该条目没有可用原图".to_string())?;
     let encrypted = std::fs::read(&path).map_err(|error| error.to_string())?;
     let png = db.crypto.decrypt(&encrypted)?;
-    pin_png(&app, &png)
+    pin_png(&app, &png).await
 }
 
 #[tauri::command]

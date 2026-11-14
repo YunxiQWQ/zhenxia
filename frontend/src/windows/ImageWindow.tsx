@@ -117,7 +117,7 @@ export function ImageWindow() {
       <header
         className="flex shrink-0 items-center justify-between border-b border-border px-4 py-2.5"
         onMouseDown={(event) => {
-          if (event.button === 0) getCurrentWindow().startDragging();
+          if (event.button === 0) invoke('start_window_drag');
         }}
       >
         <div className="flex items-center gap-2.5">

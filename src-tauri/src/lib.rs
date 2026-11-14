@@ -252,12 +252,12 @@ pub fn run_app() {
         .plugin(tauri_plugin_process::init())
         .manage(db_arc.clone())
         .on_window_event(|window, event| {
-            if window.label()=="workflow" && matches!(event,tauri::WindowEvent::Destroyed|tauri::WindowEvent::CloseRequested{..}){workflows::cancel_active();}
+            if window.label()=="workflow" && matches!(event,tauri::WindowEvent::Destroyed|tauri::WindowEvent::CloseRequested{..}){workflows::controls_closed(window.app_handle());}
             match event {
                 tauri::WindowEvent::CloseRequested { .. } if matches!(window.label(),"settings"|"translation") => {
                     let _=shortcuts::set_shortcut_recording(window.app_handle().clone(),false);
                 }
-                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::ScaleFactorChanged { .. } => {
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::ScaleFactorChanged { .. } | tauri::WindowEvent::Focused(_) => {
                     if let Some(view) = window.app_handle().get_webview_window(window.label()) {
                         window_presentation::refresh_shape(&view);
                     }
@@ -586,6 +586,7 @@ pub fn run_app() {
             commands::get_clips,
             commands::hide_history_window,
             start_history_drag,
+            window_presentation::start_window_drag,
             commands::paste_clip,
             commands::copy_clip,
             commands::paste_ocr_text,
@@ -666,6 +667,7 @@ pub fn run_app() {
             shortcuts::get_hotkey_startup_notice,
             zhenxia::start_screenshot,
             workflows::start_region_workflow,
+            workflows::start_workflow_from_capture,
             workflows::set_scroll_driving,
             workflows::start_workflow_capture,
             workflows::workflow_status,
@@ -1328,7 +1330,7 @@ async fn start_history_drag(window: tauri::WebviewWindow) -> Result<(), String> 
         return Err("History is not the active surface".into());
     }
     if HISTORY_DRAGGING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() { return Ok(()); }
-    if let Err(error) = window.start_dragging() {
+    if let Err(error) = window_presentation::start_window_drag(window.clone()).await {
         HISTORY_DRAGGING.store(false, Ordering::Release);
         return Err(error.to_string());
     }

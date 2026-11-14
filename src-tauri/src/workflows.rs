@@ -14,12 +14,43 @@ impl Drop for RawVideo{fn drop(&mut self){let _=std::fs::remove_file(&self.path)
 enum Session{Scroll(Scroll),Record(Arc<Recording>)}
 static CONTROL_READY:AtomicBool=AtomicBool::new(false);
 static PRESENTATION_READY:AtomicBool=AtomicBool::new(false);
+static RESTORE_WORKFLOW_SETTINGS:AtomicBool=AtomicBool::new(false);
 fn session()->&'static Mutex<Option<Session>>{static S:OnceLock<Mutex<Option<Session>>>=OnceLock::new();S.get_or_init(||Mutex::new(None))}
 fn capture(r:Region)->Result<RgbaImage,String>{let shot=lscreen_capture::capture_region(r.x,r.y,r.width,r.height).map_err(|e|e.to_string())?;RgbaImage::from_raw(shot.width,shot.height,shot.rgba).ok_or("Invalid capture buffer".into())}
 fn png(image:&RgbaImage)->Result<Vec<u8>,String>{let mut out=std::io::Cursor::new(Vec::new());image.write_to(&mut out,image::ImageOutputFormat::Png).map_err(|e|e.to_string())?;Ok(out.into_inner())}
 fn root()->Result<PathBuf,String>{let p=crate::components::root()?.parent().ok_or("Data directory unavailable")?.join("recordings");std::fs::create_dir_all(&p).map_err(|e|e.to_string())?;Ok(p)}
 
 pub fn available()->bool{session().lock().unwrap().is_none()}
+
+#[tauri::command]
+pub async fn start_workflow_from_capture(app:AppHandle,session_id:String,kind:String,crop:crate::zhenxia::CropRegion)->Result<(),String>{
+    if !["scroll","record"].contains(&kind.as_str())||!available(){return Err("请先完成当前捕获 / Finish the active capture first".into());}
+    let region=crate::zhenxia::workflow_region(&session_id,&crop)?;
+    let window=app.get_webview_window("main").ok_or("Capture window unavailable")?;
+    crate::window_presentation::hide(&window);
+    let result=async {
+        // Do not sample the frozen selection overlay while hide is still queued.
+        for _ in 0..200 {
+            if !window.is_visible().map_err(|e|e.to_string())? {break;}
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if window.is_visible().map_err(|e|e.to_string())?{return Err("Capture overlay did not hide".into());}
+        #[cfg(windows)]
+        tauri::async_runtime::spawn_blocking(||unsafe{let _=windows::Win32::Graphics::Dwm::DwmFlush();}).await.map_err(|e|e.to_string())?;
+        start_region_workflow(app.clone(),kind,region).await
+    }.await;
+    match result {
+        Ok(())=>{let restore=crate::zhenxia::detach_capture_for_workflow(&app);RESTORE_WORKFLOW_SETTINGS.store(restore,Ordering::Release);Ok(())},
+        Err(error)=>{let _=crate::window_presentation::show(&window);Err(error)}
+    }
+}
+
+fn restore_workflow_settings(app:&AppHandle){
+    if RESTORE_WORKFLOW_SETTINGS.swap(false,Ordering::AcqRel){
+        if let Some(window)=app.get_webview_window("settings"){let _=crate::window_presentation::show(&window);}
+    }
+}
+pub(crate) fn controls_closed(app:&AppHandle){cancel_active();restore_workflow_settings(app);}
 #[tauri::command]
 pub async fn start_region_workflow(app:AppHandle,kind:String,region:Region)->Result<(),String>{
     if !available(){return Err("请先完成当前长截图或录屏 / Finish the active capture first".into());}
@@ -36,15 +67,55 @@ pub async fn start_region_workflow(app:AppHandle,kind:String,region:Region)->Res
     Ok(())
 }
 pub(crate) fn show_controls(app:&AppHandle)->Result<(),String>{
+    let region={let guard=session().lock().unwrap();match guard.as_ref(){Some(Session::Scroll(s))=>s.region,Some(Session::Record(r))=>r.region,None=>return Err("没有正在进行的长截图或录屏 / No active capture".into())}};
     if let Some(w)=app.get_webview_window("workflow"){w.show().map_err(|e|e.to_string())?;return Ok(());}
     CONTROL_READY.store(false,Ordering::Release);
-    let w=tauri::WebviewWindowBuilder::new(app,"workflow",tauri::WebviewUrl::App("index.html?window=workflow".into())).title("帧匣 · 捕获控制").inner_size(360.,420.).visible(false).decorations(false).transparent(true).shadow(false).always_on_top(true).skip_taskbar(true).focused(false).resizable(false).disable_drag_drop_handler().build().map_err(|e|e.to_string())?;
-    if let Ok(Some(m))=w.current_monitor(){let size=m.size();let pos=m.position();let scale=m.scale_factor();let _=w.set_position(tauri::PhysicalPosition::new(pos.x+size.width as i32-(380.*scale) as i32,pos.y+(40.*scale) as i32));}
+    let w=tauri::WebviewWindowBuilder::new(app,"workflow",tauri::WebviewUrl::App("index.html?window=workflow".into())).title("帧匣 · 捕获控制").inner_size(360.,420.).visible(false).decorations(false).minimizable(false).maximizable(false).transparent(true).shadow(false).always_on_top(true).skip_taskbar(true).focused(false).resizable(false).disable_drag_drop_handler().build().map_err(|e|e.to_string())?;
+    let monitor=w.available_monitors().unwrap_or_default().into_iter().find(|m|{
+        let p=m.position();let s=m.size();let x=region.x+region.width as i32/2;let y=region.y+region.height as i32/2;
+        x>=p.x&&y>=p.y&&x<p.x+s.width as i32&&y<p.y+s.height as i32
+    }).or_else(||w.current_monitor().ok().flatten());
+    if let Some(m)=monitor{
+        let area=m.work_area();let scale=m.scale_factor();
+        let (x,y)=control_origin(Region{x:area.position.x,y:area.position.y,width:area.size.width,height:area.size.height},region,(360.*scale) as i32,(420.*scale) as i32);
+        let _=w.set_position(tauri::PhysicalPosition::new(x,y));
+    }
     #[cfg(windows)]if let Ok(h)=w.hwnd(){unsafe{use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity,WDA_EXCLUDEFROMCAPTURE};let _=SetWindowDisplayAffinity(windows::Win32::Foundation::HWND(h.0 as _),WDA_EXCLUDEFROMCAPTURE);}}
     crate::window_presentation::refresh_shape(&w);CONTROL_READY.store(true,Ordering::Release);Ok(())
 }
+
+fn control_origin(work:Region,region:Region,width:i32,height:i32)->(i32,i32){
+    let candidates=[(region.x+region.width as i32+12,region.y),(region.x-width-12,region.y),
+        (region.x,region.y+region.height as i32+12),(region.x,region.y-height-12),
+        (work.x+work.width as i32-width-12,work.y+12),(work.x+12,work.y+12)];
+    let clamp=|x:i32,y:i32|(x.clamp(work.x,(work.x+work.width as i32-width).max(work.x)),y.clamp(work.y,(work.y+work.height as i32-height).max(work.y)));
+    candidates.into_iter().map(|(x,y)|clamp(x,y)).min_by_key(|&(x,y)|{
+        let w=(x+width).min(region.x+region.width as i32)-x.max(region.x);
+        let h=(y+height).min(region.y+region.height as i32)-y.max(region.y);
+        w.max(0) as u64*h.max(0) as u64
+    }).unwrap()
+}
+
+#[cfg(test)]mod placement_tests{
+    use super::*;
+    #[test]fn controls_avoid_the_selected_region_when_space_is_available(){
+        for (work,region,width,height) in [
+            (Region{x:0,y:0,width:2560,height:1400},Region{x:1700,y:80,width:640,height:480},360,420),
+            (Region{x:-1920,y:0,width:1920,height:1080},Region{x:-1920,y:20,width:1200,height:800},540,630),
+        ]{
+            let (x,y)=control_origin(work,region,width,height);
+            assert!(x>=work.x&&y>=work.y&&x+width<=work.x+work.width as i32&&y+height<=work.y+work.height as i32);
+            assert!(x>=region.x+region.width as i32||x+width<=region.x||y>=region.y+region.height as i32||y+height<=region.y);
+        }
+    }
+    #[test]fn full_screen_selection_keeps_controls_within_the_work_area(){
+        let work=Region{x:-1280,y:-720,width:1280,height:720};
+        let (x,y)=control_origin(work,work,360,420);
+        assert!(x>=-1280&&y>=-720&&x+360<=0&&y+420<=0);
+    }
+}
 pub fn cancel_active(){let mut guard=session().lock().unwrap();if let Some(Session::Record(r))=guard.as_ref(){r.cancel.store(true,Ordering::Release);r.stop.store(true,Ordering::Release);}*guard=None;}
-#[tauri::command]pub fn cancel_workflow(app:AppHandle){cancel_active();if let Some(w)=app.get_webview_window("workflow"){let _=w.destroy();}}
+#[tauri::command]pub fn cancel_workflow(app:AppHandle){cancel_active();if let Some(w)=app.get_webview_window("workflow"){let _=w.destroy();}restore_workflow_settings(&app);}
 fn sample_inner()->Result<bool,String>{
     let (id,region,revision)={let g=session().lock().unwrap();match g.as_ref(){Some(Session::Scroll(s))=>(s.id.clone(),s.region,s.revision),_=>return Err("No scrolling capture".into())}};
     let frame=capture(region)?;let mut g=session().lock().unwrap();let Some(Session::Scroll(s))=g.as_mut() else{return Err("Capture ended".into())};if s.id!=id||s.revision!=revision{return Err("Capture changed".into());}
@@ -88,8 +159,12 @@ fn drive_scroll()->Result<bool,String>{
     let bytes=tauri::async_runtime::spawn_blocking(move||png(&image)).await.map_err(|e|e.to_string())??;
     let stored=crate::zhenxia::insert_image_history(&app,&db,&bytes,serde_json::json!({"kind":"screenshot","source":"zhenxia","mode":"scroll"}),false).await?;
     {let mut g=session().lock().unwrap();if matches!(g.as_ref(),Some(Session::Scroll(s)) if s.id==id){*g=None;}}
+    let restore=RESTORE_WORKFLOW_SETTINGS.swap(false,Ordering::AcqRel);
     if let Some(w)=app.get_webview_window("workflow"){let _=w.destroy();}
-    crate::zhenxia::edit_clip_image(app,db,stored.id.clone()).await?;Ok(stored.id)
+    if let Err(error)=crate::zhenxia::edit_clip_image(app.clone(),db,stored.id.clone()).await{
+        RESTORE_WORKFLOW_SETTINGS.store(restore,Ordering::Release);restore_workflow_settings(&app);return Err(error);
+    }
+    crate::zhenxia::restore_settings_when_editor_closes(restore);Ok(stored.id)
 }
 
 #[tauri::command]pub fn begin_recording(format:String,fps:u32)->Result<(),String>{
@@ -136,7 +211,7 @@ async fn table(db:&Database)->Result<(),String>{sqlx::query("CREATE TABLE IF NOT
     let id=uuid::Uuid::new_v4().to_string();let target=root()?.join(format!("{id}.zxrec"));
     seal_file(&db,&raw.path,&target)?;table(&db).await?;
     sqlx::query("INSERT INTO capture_recordings VALUES(?,?,?,?,?,?,?,?)").bind(&id).bind(chrono::Utc::now().to_rfc3339()).bind(target.to_string_lossy().as_ref()).bind(db.crypto.encrypt(&raw.thumbnail)?).bind(c.region.width).bind(c.region.height).bind(raw.duration as i64).bind(&c.format).execute(&db.pool).await.map_err(|e|e.to_string())?;
-    *session().lock().unwrap()=None;let _=app.emit("clipboard-change",serde_json::json!({"source":"recording"}));if let Some(w)=app.get_webview_window("workflow"){let _=w.destroy();}
+    *session().lock().unwrap()=None;RESTORE_WORKFLOW_SETTINGS.store(false,Ordering::Release);let _=app.emit("clipboard-change",serde_json::json!({"source":"recording"}));if let Some(w)=app.get_webview_window("workflow"){let _=w.destroy();}
     crate::commands::open_settings_section(app,"captures".into()).await?;Ok(id)
 }
 fn seal_file(db:&Database,source:&Path,target:&Path)->Result<(),String>{
@@ -163,14 +238,14 @@ pub async fn clear_recordings(db:&Database)->Result<usize,String>{use sqlx::Row;
 
 #[tauri::command]pub async fn start_workflow_capture(app:AppHandle,kind:String)->Result<(),String>{if !["scroll","record"].contains(&kind.as_str()){return Err("Unknown workflow".into());}if !available(){return Err("Finish the active capture first".into());}crate::zhenxia::start_screenshot_with_intent(app,kind).await}
 #[tauri::command]pub async fn start_presentation(app:AppHandle)->Result<(),String>{
-    if let Some(w)=app.get_webview_window("presentation"){w.set_ignore_cursor_events(false).map_err(|e|e.to_string())?;let _=w.emit("presentation-restored",());w.show().map_err(|e|e.to_string())?;w.set_focus().map_err(|e|e.to_string())?;return Ok(());}
+    if let Some(w)=app.get_webview_window("presentation"){w.set_ignore_cursor_events(false).map_err(|e|e.to_string())?;let _=w.emit("presentation-restored",());crate::window_presentation::refresh_shape_before_show(&w).await?;w.show().map_err(|e|e.to_string())?;w.set_focus().map_err(|e|e.to_string())?;return Ok(());}
     PRESENTATION_READY.store(false,Ordering::Release);
     let (x,y)=lscreen_capture::cursor_position().unwrap_or((0,0));let shot=lscreen_capture::capture_at(x,y).map_err(|e|e.to_string())?;
-    let w=tauri::WebviewWindowBuilder::new(&app,"presentation",tauri::WebviewUrl::App("index.html?window=presentation".into())).title("帧匣 · 演示画布").visible(false).transparent(true).decorations(false).shadow(false).always_on_top(true).skip_taskbar(true).resizable(false).disable_drag_drop_handler().build().map_err(|e|e.to_string())?;
+    let w=tauri::WebviewWindowBuilder::new(&app,"presentation",tauri::WebviewUrl::App("index.html?window=presentation".into())).title("帧匣 · 演示画布").visible(false).transparent(true).decorations(false).minimizable(false).maximizable(false).shadow(false).always_on_top(true).skip_taskbar(true).resizable(false).disable_drag_drop_handler().build().map_err(|e|e.to_string())?;
     w.set_position(tauri::PhysicalPosition::new(shot.origin.0,shot.origin.1)).map_err(|e|e.to_string())?;w.set_size(tauri::PhysicalSize::new(shot.width,shot.height)).map_err(|e|e.to_string())?;PRESENTATION_READY.store(true,Ordering::Release);Ok(())
 }
-#[tauri::command]pub fn presentation_passthrough(app:AppHandle,enabled:bool)->Result<(),String>{app.get_webview_window("presentation").ok_or("Presentation is closed")?.set_ignore_cursor_events(enabled).map_err(|e|e.to_string())}
+#[tauri::command]pub fn presentation_passthrough(app:AppHandle,enabled:bool)->Result<(),String>{let w=app.get_webview_window("presentation").ok_or("Presentation is closed")?;w.set_ignore_cursor_events(enabled).map_err(|e|e.to_string())?;crate::window_presentation::refresh_shape(&w);Ok(())}
 
 async fn wait_layout(flag:&AtomicBool)->Result<(),String>{for _ in 0..200{if flag.load(Ordering::Acquire){return Ok(());}tokio::time::sleep(Duration::from_millis(10)).await;}Err("Window layout is not ready".into())}
-#[tauri::command]pub async fn presentation_ready(app:AppHandle)->Result<(),String>{wait_layout(&PRESENTATION_READY).await?;let w=app.get_webview_window("presentation").ok_or("Presentation closed")?;crate::window_presentation::prepare(&w);w.show().map_err(|e|e.to_string())?;w.set_focus().map_err(|e|e.to_string())}
-#[tauri::command]pub async fn workflow_ready(app:AppHandle)->Result<(),String>{wait_layout(&CONTROL_READY).await?;let w=app.get_webview_window("workflow").ok_or("Controls closed")?;crate::window_presentation::prepare(&w);#[cfg(windows)]if let Ok(h)=w.hwnd(){unsafe{let _=windows::Win32::UI::WindowsAndMessaging::ShowWindow(windows::Win32::Foundation::HWND(h.0 as _),windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE);}return Ok(());}w.show().map_err(|e|e.to_string())}
+#[tauri::command]pub async fn presentation_ready(app:AppHandle)->Result<(),String>{wait_layout(&PRESENTATION_READY).await?;let w=app.get_webview_window("presentation").ok_or("Presentation closed")?;crate::window_presentation::refresh_shape_before_show(&w).await?;crate::window_presentation::prepare(&w);w.show().map_err(|e|e.to_string())?;w.set_focus().map_err(|e|e.to_string())}
+#[tauri::command]pub async fn workflow_ready(app:AppHandle)->Result<(),String>{wait_layout(&CONTROL_READY).await?;let w=app.get_webview_window("workflow").ok_or("Controls closed")?;crate::window_presentation::refresh_shape_before_show(&w).await?;crate::window_presentation::prepare(&w);#[cfg(windows)]if let Ok(h)=w.hwnd(){unsafe{let _=windows::Win32::UI::WindowsAndMessaging::ShowWindow(windows::Win32::Foundation::HWND(h.0 as _),windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE);}return Ok(());}w.show().map_err(|e|e.to_string())}

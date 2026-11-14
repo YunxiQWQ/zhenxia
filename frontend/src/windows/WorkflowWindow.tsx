@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import { X, Square, Pause, Play, Camera, GripHorizontal } from 'lucide-react';
 import { useTranslation } from '../i18n';
 interface Status {
@@ -72,7 +71,7 @@ export function WorkflowWindow() {
       <header
         className="mb-3 flex cursor-move items-center justify-between border-b border-border pb-2"
         onPointerDown={(e) => {
-          if (!(e.target as HTMLElement).closest('button')) void getCurrentWindow().startDragging();
+          if (!(e.target as HTMLElement).closest('button')) void invoke('start_window_drag');
         }}
       >
         <strong className="flex items-center gap-2 text-sm">

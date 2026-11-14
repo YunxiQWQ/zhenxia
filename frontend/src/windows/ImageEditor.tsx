@@ -2,7 +2,6 @@ import { WatermarkPanel } from '../components/WatermarkPanel';
 import { DEFAULT_WATERMARK, type Watermark } from '../editor/watermark';
 import { useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   ArrowDown,
   ArrowUp,
@@ -756,7 +755,7 @@ export default function ImageEditor({
         }}
         onPointerDown={(e) => {
           if (e.button === 0 && !(e.target as HTMLElement).closest('button'))
-            void getCurrentWindow().startDragging();
+            void invoke('start_window_drag');
         }}
       >
         <div className="ie-brand">

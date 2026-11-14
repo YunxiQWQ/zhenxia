@@ -703,14 +703,11 @@ export function CaptureOverlay() {
       }
       setBusy(true);
       try {
-        const region = {
-          x: Math.round(session.origin_x + selection.x),
-          y: Math.round(session.origin_y + selection.y),
-          width: Math.round(selection.w),
-          height: Math.round(selection.h),
-        };
-        await invoke('cancel_screenshot', { sessionId: session.session_id });
-        await invoke('start_region_workflow', { kind, region });
+        await invoke('start_workflow_from_capture', {
+          sessionId: session.session_id,
+          kind,
+          crop: { x: selection.x, y: selection.y, width: selection.w, height: selection.h },
+        });
       } catch (e) {
         setError(String(e));
       } finally {
