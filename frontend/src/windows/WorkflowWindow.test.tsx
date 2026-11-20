@@ -3,6 +3,8 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
 import { WorkflowWindow } from './WorkflowWindow';
 vi.mock('../i18n', () => ({ useTranslation: () => ({ lang: 'zh-CN' }) }));
+vi.mock('../hooks/useSystemAccent', () => ({ useSystemAccent: () => {} }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
 vi.mock('@tauri-apps/api/window', () => ({ getCurrentWindow: () => ({ startDragging: vi.fn() }) }));
 let state: Record<string, unknown>;
 beforeEach(() => {
