@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from 'react';
 import { FeatureLauncher } from '../components/FeatureLauncher';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -71,7 +71,7 @@ const filterSelectClass =
  */
 export function HistoryWindow({ active = true }: { active?: boolean }) {
   const { t } = useTranslation();
-  const [clips, setClips] = useState<ClipboardItem[]>([]);
+  const [clips, replaceClips] = useState<ClipboardItem[]>([]);
   const [folders, setFolders] = useState<FolderItem[]>([]);
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -124,6 +124,15 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
 
   const clipsRef = useRef<ClipboardItem[]>(clips);
   clipsRef.current = clips;
+  const tabPages = useRef<{
+    scope: string;
+    pages: Partial<Record<ContentFilter, ClipboardItem[]>>;
+  } | null>(null);
+  const setClips = useCallback((update: SetStateAction<ClipboardItem[]>) => {
+    // Local edits and removals may also affect the other tabs' snapshots.
+    tabPages.current = null;
+    replaceClips(update);
+  }, []);
   // Cursor for the next page, captured from the backend's own ordering.
   // Never read off clipsRef: a pin/unpin re-sorts that array in place.
   const pageCursorRef = useRef<string | null>(null);
@@ -135,6 +144,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
   // Guards against an older load landing after a newer one and restoring stale
   // results — the same discipline the flyout uses.
   const loadIdRef = useRef(0);
+  const listReadPending = useRef(false);
   // Which query the rows on screen answer. A failed replace only has to wipe
   // them when this no longer matches the load that failed — a same-filter
   // refresh (clipboard change, window focus, post-edit reload) leaves a
@@ -192,19 +202,17 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
   // Destructured so the load callback depends on the two stamps rather than a
   // fresh object identity each render, which would reload on every keystroke.
   const { from: dateFrom, to: dateTo } = dateRange;
+  const query = searchQuery.trim();
+  const filterScope = JSON.stringify([selectedFolder, query, dateFrom, dateTo, sourceApp]);
+  const filterKey = `${filterScope}:${contentFilter}`;
+  const activeQuery = useRef<string | null>(null);
+  activeQuery.current = active ? filterKey : null;
 
   const loadClips = useCallback(
     async (append: boolean): Promise<ClipLoadResult> => {
+      if (activeQuery.current !== filterKey) return 'superseded';
       const loadId = ++loadIdRef.current;
-      const query = searchQuery.trim();
-      const filterKey = JSON.stringify([
-        selectedFolder,
-        query,
-        contentFilter,
-        dateFrom,
-        dateTo,
-        sourceApp,
-      ]);
+      const stillCurrent = () => loadId === loadIdRef.current && activeQuery.current === filterKey;
       const loadedCount = clipsRef.current.length;
       // A compact initial page fills the viewport. Keep the usual refresh
       // size once the user has paged through the same query and may be using
@@ -218,6 +226,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
       );
 
       try {
+        listReadPending.current = true;
         setIsLoading(true);
 
         const data = query
@@ -244,8 +253,14 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
               sourceApp,
             });
 
-        if (loadId !== loadIdRef.current) return 'superseded';
-        setClips((previous) => (append ? [...previous, ...data] : data));
+        if (!stillCurrent()) return 'superseded';
+        replaceClips((previous) => (append ? [...previous, ...data] : data));
+        if (!append) {
+          if (tabPages.current?.scope !== filterScope) {
+            tabPages.current = { scope: filterScope, pages: {} };
+          }
+          tabPages.current.pages[contentFilter] = data.slice(0, FIRST_PAGE_SIZE);
+        }
         pageCursorRef.current = nextPageCursor(data, append ? pageCursorRef.current : null);
         visibleFilterKeyRef.current = filterKey;
         setHasMore(data.length === page.limit);
@@ -254,7 +269,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
       } catch (error) {
         // Superseded is unknown, not success: a caller that toasts "deleted"
         // from this return would announce work the newer load has not applied.
-        if (loadId !== loadIdRef.current) return 'superseded';
+        if (!stillCurrent()) return 'superseded';
         console.error('Failed to load clips:', error);
         setHasMore(false);
         const failure = clipLoadFailure({
@@ -263,7 +278,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
           hasVisibleClips: clipsRef.current.length > 0,
         });
         if (failure.clearList) {
-          setClips([]);
+          replaceClips([]);
           pageCursorRef.current = null;
           // The empty list now stands for this query, so retrying it is a
           // same-filter refresh rather than another filter change.
@@ -281,11 +296,50 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         }
         return 'failed';
       } finally {
-        if (loadId === loadIdRef.current) setIsLoading(false);
+        if (stillCurrent()) {
+          listReadPending.current = false;
+          setIsLoading(false);
+        }
       }
     },
-    [contentFilter, dateFrom, dateTo, searchQuery, selectedFolder, sourceApp]
+    [contentFilter, dateFrom, dateTo, filterKey, filterScope, query, selectedFolder, sourceApp]
   );
+  const reloadCurrentClips = useRef(loadClips);
+  reloadCurrentClips.current = loadClips;
+
+  const refreshAfterMutation = useCallback(() => {
+    tabPages.current = null;
+    return reloadCurrentClips.current(false);
+  }, []);
+
+  const changeContentFilter = (next: ContentFilter) => {
+    if (next === contentFilter) return;
+    const pages = tabPages.current?.scope === filterScope ? tabPages.current.pages : undefined;
+    const current = visibleFilterKeyRef.current === filterKey ? clipsRef.current : [];
+    // Use only matching rows already in memory. The backend still supplies the
+    // full first page and cursor, including matches beyond the loaded rows.
+    const fallback = contentFilter === 'all' ? current : (pages?.all ?? current);
+    const rows =
+      pages?.[next] ??
+      fallback
+        .filter(
+          (clip) => next === 'all' || clip.clip_type === (next === 'images' ? 'image' : 'text')
+        )
+        .slice(0, FIRST_PAGE_SIZE);
+    const nextKey = `${filterScope}:${next}`;
+    ++loadIdRef.current;
+    activeQuery.current = nextKey;
+    visibleFilterKeyRef.current = nextKey;
+    pageCursorRef.current = null;
+    replaceClips(rows);
+    setSelectedClipId((id) => (rows.some((clip) => clip.id === id) ? id : (rows[0]?.id ?? null)));
+    setDetailsOpen(false);
+    listReadPending.current = true;
+    setIsLoading(true);
+    setHasMore(true);
+    setLoadError(false);
+    setContentFilter(next);
+  };
 
   const loadFolders = useCallback(async () => {
     try {
@@ -340,6 +394,8 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
     if (!active) {
       // Keep selection and drafts, but discard any pending hidden-list response.
       blurredWhileOpen.current = false;
+      tabPages.current = null;
+      listReadPending.current = false;
       ++loadIdRef.current;
       return;
     }
@@ -369,6 +425,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
     let disposed = false;
     const refresh = async () => {
       if (disposed) return;
+      tabPages.current = null;
       const previous = selectedFolderRef.current;
       await loadFolders();
       if (disposed) return;
@@ -403,7 +460,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
       unlistenClipboard.then((dispose) => dispose()).catch(() => undefined);
       unlistenOcr.then((dispose) => dispose()).catch(() => undefined);
     };
-  }, [active, loadClips, loadFolders, refreshTotalCount, loadSourceApps]);
+  }, [active, loadClips, loadFolders, refreshTotalCount, loadSourceApps, setClips]);
 
   const selectedClip = useMemo(
     () => clips.find((clip) => clip.id === selectedClipId) ?? null,
@@ -452,14 +509,14 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         visibleFilterKeyRef.current = null;
       }
       const [reloaded] = await Promise.all([
-        loadClips(false),
+        refreshAfterMutation(),
         loadFolders(),
         refreshTotalCount(),
         loadSourceApps(),
       ]);
       return reloaded;
     },
-    [clearSelection, loadClips, loadFolders, refreshTotalCount, loadSourceApps]
+    [clearSelection, refreshAfterMutation, loadFolders, refreshTotalCount, loadSourceApps]
   );
 
   const handleBulkDelete = useCallback(async () => {
@@ -672,7 +729,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         updateRevealed(clipId, { content: text, preview: text });
         // Same-filter reload: loadClips already shows the stale banner on
         // failure. A second toast here would talk over it.
-        if (!clipLoadAnnouncesSuccess(await loadClips(false))) {
+        if (!clipLoadAnnouncesSuccess(await refreshAfterMutation())) {
           return;
         }
         toast.success('Clip updated');
@@ -682,7 +739,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         throw error;
       }
     },
-    [loadClips, updateRevealed]
+    [refreshAfterMutation, updateRevealed]
   );
   const handleSaveNotes = useCallback(
     async (clipId: string, notes: string) => {
@@ -700,26 +757,29 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         toast.error('Failed to save the note');
       }
     },
-    [updateRevealed]
+    [setClips, updateRevealed]
   );
 
-  const handleSaveOcrText = useCallback(async (clipId: string, text: string) => {
-    try {
-      await invoke('set_clip_ocr_text', { id: clipId, text });
-      // Mark the row as having recognized text so the pane refetches and the
-      // "paste text" affordances appear.
-      setClips((current) =>
-        current.map((clip) =>
-          clip.id === clipId ? { ...clip, has_ocr_text: text.trim().length > 0 } : clip
-        )
-      );
-      toast.success('Recognized text updated');
-    } catch (error) {
-      console.error('Failed to save the recognized text:', error);
-      toast.error('Failed to save the recognized text');
-      throw error;
-    }
-  }, []);
+  const handleSaveOcrText = useCallback(
+    async (clipId: string, text: string) => {
+      try {
+        await invoke('set_clip_ocr_text', { id: clipId, text });
+        // Mark the row as having recognized text so the pane refetches and the
+        // "paste text" affordances appear.
+        setClips((current) =>
+          current.map((clip) =>
+            clip.id === clipId ? { ...clip, has_ocr_text: text.trim().length > 0 } : clip
+          )
+        );
+        toast.success('Recognized text updated');
+      } catch (error) {
+        console.error('Failed to save the recognized text:', error);
+        toast.error('Failed to save the recognized text');
+        throw error;
+      }
+    },
+    [setClips]
+  );
 
   const handleRescanOcr = useCallback(async (clipId: string) => {
     try {
@@ -761,52 +821,55 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         // Same-filter reload: a failure shows the stale banner over the rows,
         // the way handleSaveText already relies on. A toast here would be a
         // second channel for one failed reload.
-        if (!clipLoadAnnouncesSuccess(await loadClips(false))) return;
+        if (!clipLoadAnnouncesSuccess(await refreshAfterMutation())) return;
         toast.success(hidden ? 'Clip hidden' : 'Clip no longer hidden');
       } catch (error) {
         console.error('Failed to change clip visibility:', error);
         toast.error('Failed to change clip visibility');
       }
     },
-    [forgetRevealed, loadClips]
+    [forgetRevealed, refreshAfterMutation, setClips]
   );
 
-  const handleTogglePin = useCallback(async (clipId: string) => {
-    try {
-      const isPinned = await invoke<boolean>('toggle_clip_pin', { id: clipId });
-      setClips((previous) =>
-        previous
-          .map((clip) => (clip.id === clipId ? { ...clip, is_pinned: isPinned } : clip))
-          .sort(
-            (left, right) =>
-              Number(right.is_pinned) - Number(left.is_pinned) ||
-              new Date(right.created_at).getTime() - new Date(left.created_at).getTime()
-          )
-      );
-      toast.success(isPinned ? 'Clip pinned' : 'Clip unpinned');
-    } catch (error) {
-      console.error('Failed to update pin state:', error);
-      toast.error('Failed to update pin state');
-    }
-  }, []);
+  const handleTogglePin = useCallback(
+    async (clipId: string) => {
+      try {
+        const isPinned = await invoke<boolean>('toggle_clip_pin', { id: clipId });
+        setClips((previous) =>
+          previous
+            .map((clip) => (clip.id === clipId ? { ...clip, is_pinned: isPinned } : clip))
+            .sort(
+              (left, right) =>
+                Number(right.is_pinned) - Number(left.is_pinned) ||
+                new Date(right.created_at).getTime() - new Date(left.created_at).getTime()
+            )
+        );
+        toast.success(isPinned ? 'Clip pinned' : 'Clip unpinned');
+      } catch (error) {
+        console.error('Failed to update pin state:', error);
+        toast.error('Failed to update pin state');
+      }
+    },
+    [setClips]
+  );
 
   const handleDelete = useCallback(
     async (clipId: string) => {
-      const current = clipsRef.current;
-      const deletedIndex = current.findIndex((clip) => clip.id === clipId);
-      const remaining = current.filter((clip) => clip.id !== clipId);
-      const nextSelection =
-        deletedIndex < 0
-          ? (remaining[0]?.id ?? null)
-          : (remaining[Math.min(deletedIndex, remaining.length - 1)]?.id ?? null);
       try {
         // Cubby has no trash, so delete removes the payload immediately rather
         // than leaving a hidden soft-delete. Same contract as the flyout.
         await invoke('delete_clip', { id: clipId, hardDelete: true });
         forgetRevealed(clipId);
-        setClips(remaining);
-        setDetailsOpen(false);
-        setSelectedClipId(nextSelection);
+        // A tab switch during deletion may have replaced the old row set.
+        const current = clipsRef.current;
+        const deletedIndex = current.findIndex((clip) => clip.id === clipId);
+        setClips((rows) => rows.filter((clip) => clip.id !== clipId));
+        if (deletedIndex >= 0) {
+          const nextSelection = current[deletedIndex + 1]?.id ?? current[deletedIndex - 1]?.id;
+          setDetailsOpen(false);
+          setSelectedClipId((id) => (id === clipId ? (nextSelection ?? null) : id));
+        }
+        if (listReadPending.current) void refreshAfterMutation();
         loadFolders();
         refreshTotalCount();
         toast.success('Clip deleted');
@@ -815,7 +878,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         toast.error('Failed to delete clip');
       }
     },
-    [forgetRevealed, loadFolders, refreshTotalCount]
+    [forgetRevealed, loadFolders, refreshAfterMutation, refreshTotalCount, setClips]
   );
 
   const handleClose = useCallback(() => {
@@ -1042,10 +1105,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
           setDetailsOpen(false);
         }}
         contentFilter={contentFilter}
-        onContentFilterChange={(filter) => {
-          setContentFilter(filter);
-          setDetailsOpen(false);
-        }}
+        onContentFilterChange={changeContentFilter}
         folders={folders}
         selectedFolder={selectedFolder}
         onSelectFolder={(folder) => {
@@ -1058,8 +1118,8 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
           const r = event.currentTarget.getBoundingClientRect();
           setMenu({ x: r.right, y: r.bottom });
         }}
-        selectedClipId={selectedClipId}
-        hasClipListbox={!isLoading && clips.length > 0}
+        selectedClipId={selectedClip?.id ?? null}
+        hasClipListbox={!detailsOpen && clips.length > 0}
       />
       {filtersOpen && (
         <div
@@ -1414,7 +1474,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
               clearSelection();
               setDetailsOpen(false);
               setClearRequest(null);
-              await loadClips(false);
+              await refreshAfterMutation();
               await loadFolders();
               await refreshTotalCount();
             })
@@ -1453,6 +1513,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
           if (!selectedFolder) return;
           void invoke('delete_folder', { id: selectedFolder })
             .then(async () => {
+              tabPages.current = null;
               setDeleteFolderOpen(false);
               setSelectedFolder(null);
               await loadFolders();

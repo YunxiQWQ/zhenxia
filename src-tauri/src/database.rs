@@ -489,11 +489,17 @@ impl Database {
         )
         .await?;
 
-        // Ordinary history pages can walk the visible rows in display order
-        // and stop at the limit without sorting large image records.
+        // History can stop at the page limit without sorting large records.
+        // The type index also lets Text skip earlier Image rows entirely.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_clips_live_history_order
              ON clips(is_pinned DESC, created_at DESC, uuid DESC) WHERE is_deleted = 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_clips_live_history_type_order
+             ON clips(clip_type, is_pinned DESC, created_at DESC, uuid DESC) WHERE is_deleted = 0",
         )
         .execute(&self.pool)
         .await?;

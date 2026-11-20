@@ -214,6 +214,109 @@ describe('unified Win+V history keyboard contract', () => {
 });
 
 describe('compact Cubby history', () => {
+  it('switches types immediately, restores first pages, and ignores an older tab reply', async () => {
+    const image = { ...fixture, id: 'image', clip_type: 'image' };
+    const extraText = { ...fixture, id: 'older-text' };
+    let finishImages!: (rows: (typeof fixture)[]) => void;
+    let finishText!: (rows: (typeof fixture)[]) => void;
+    const pendingImages = new Promise<(typeof fixture)[]>((resolve) => {
+      finishImages = resolve;
+    });
+    const pendingText = new Promise<(typeof fixture)[]>((resolve) => {
+      finishText = resolve;
+    });
+    const backend = vi.mocked(invoke).getMockImplementation()!;
+    vi.mocked(invoke).mockImplementation((command, args) => {
+      if (command !== 'get_clips') return backend(command, args);
+      const filter = args && 'contentFilter' in args ? args.contentFilter : 'all';
+      if (filter === 'images') return pendingImages;
+      if (filter === 'text') return pendingText;
+      return Promise.resolve([fixture, image]);
+    });
+
+    const { container, getByRole } = await open();
+    const row = (id: string) => container.querySelector(`[data-clip-id="${id}"]`);
+    const tab = (name: string) => getByRole('button', { name });
+    expect(row('image')).not.toBeNull();
+    fireEvent.click(tab('Images'));
+    expect(tab('Images')).toHaveAttribute('aria-pressed', 'true');
+    expect(row('image')).not.toBeNull();
+    expect(row('first')).toBeNull();
+
+    fireEvent.click(tab('Text'));
+    expect(row('first')).not.toBeNull();
+    expect(row('image')).toBeNull();
+    await act(async () => finishImages([image]));
+    expect(row('image')).toBeNull();
+    await act(async () => finishText([fixture, extraText]));
+    expect(row('older-text')).not.toBeNull();
+
+    fireEvent.click(tab('All'));
+    expect(row('image')).not.toBeNull();
+    expect(row('older-text')).toBeNull();
+    fireEvent.click(tab('Text'));
+    expect(row('older-text')).not.toBeNull();
+    expect(row('image')).toBeNull();
+  });
+
+  it('shows loading instead of an empty result until a tab without local matches replies', async () => {
+    let finishImages!: (rows: (typeof fixture)[]) => void;
+    const pendingImages = new Promise<(typeof fixture)[]>((resolve) => {
+      finishImages = resolve;
+    });
+    const backend = vi.mocked(invoke).getMockImplementation()!;
+    vi.mocked(invoke).mockImplementation((command, args) =>
+      command === 'get_clips' && args && 'contentFilter' in args && args.contentFilter === 'images'
+        ? pendingImages
+        : backend(command, args)
+    );
+
+    const { container, getByRole } = await open();
+    fireEvent.click(getByRole('button', { name: 'Images' }));
+    expect(container.querySelector('[data-clip-id="first"]')).toBeNull();
+    expect(container).not.toHaveTextContent('No images yet');
+    expect(container.querySelector('.animate-spin')).not.toBeNull();
+    await act(async () => finishImages([]));
+    expect(container).toHaveTextContent('No images yet');
+  });
+
+  it('does not resurrect a deleted image from an older tab read', async () => {
+    const image = { ...fixture, id: 'deleted-image', clip_type: 'image' };
+    const remainingImage = { ...image, id: 'remaining-image' };
+    let finishImages!: (rows: (typeof fixture)[]) => void;
+    let finishDelete!: () => void;
+    const pendingImages = new Promise<(typeof fixture)[]>((resolve) => {
+      finishImages = resolve;
+    });
+    const pendingDelete = new Promise<void>((resolve) => {
+      finishDelete = resolve;
+    });
+    let imageReads = 0;
+    const backend = vi.mocked(invoke).getMockImplementation()!;
+    vi.mocked(invoke).mockImplementation((command, args) => {
+      if (command === 'delete_clip') return pendingDelete;
+      if (command === 'get_clips') {
+        if (args && 'contentFilter' in args && args.contentFilter === 'images') {
+          return ++imageReads === 1 ? pendingImages : Promise.resolve([remainingImage]);
+        }
+        return Promise.resolve([fixture, image, remainingImage]);
+      }
+      return backend(command, args);
+    });
+
+    const { container, getByRole } = await open();
+    const row = (id: string) => container.querySelector(`[data-clip-id="${id}"]`);
+    fireEvent.click(getByRole('button', { name: 'Images' }));
+    expect(row('deleted-image')).toHaveAttribute('data-selected', 'true');
+    fireEvent.keyDown(document.body, { key: 'Delete' });
+    expect(invoke).toHaveBeenCalledWith('delete_clip', { id: 'deleted-image', hardDelete: true });
+    await act(async () => finishDelete());
+    expect(imageReads).toBe(2);
+    await act(async () => finishImages([image, remainingImage]));
+    expect(row('deleted-image')).toBeNull();
+    expect(row('remaining-image')).not.toBeNull();
+  });
+
   it('requests a short first page and decodes only image rows near the viewport', async () => {
     const images = Array.from({ length: 30 }, (_, index) => ({
       ...fixture,
