@@ -171,44 +171,16 @@ pub async fn save_settings(
     }
 
     crate::components::configure(&new_settings.capture);
-    // Window effect
-    let theme_str = new_settings.theme.clone();
-    let mica_effect = new_settings.mica_effect.clone();
-    let round_corners = new_settings.round_corners;
-    log::info!(
-        "save_settings: mica_effect={}, theme={}",
-        mica_effect,
-        theme_str
-    );
-    for label in ["main", "settings","translation"] {
-    match app.get_webview_window(label) {
-        Some(win) => {
-            let current_theme = if theme_str == "light" {
-                tauri::Theme::Light
-            } else if theme_str == "dark" {
-                tauri::Theme::Dark
-            } else {
-                match dark_light::detect() {
-                    Ok(Mode::Dark) => tauri::Theme::Dark,
-                    Ok(_) => tauri::Theme::Light,
-                    Err(error) => {
-                        log::warn!(
-                            "save_settings: system theme detection failed, using window theme: {:?}",
-                            error
-                        );
-                        win.theme().unwrap_or(tauri::Theme::Dark)
-                    }
-                }
-            };
-            crate::apply_window_effect(&win, &mica_effect, &current_theme, round_corners);
-        }
-        None => {
-            log::debug!("save_settings: {label} window not open, skipping window effect");
+    if new_settings.theme != current.theme
+        || new_settings.mica_effect != current.mica_effect
+        || new_settings.round_corners != current.round_corners
+    {
+        for window in app.webview_windows().values() {
+            if crate::window_presentation::is_custom_surface(window.label()) {
+                crate::apply_window_appearance(window, &new_settings);
+            }
         }
     }
-    }
-
-    log::info!("save_settings: theme={}", new_settings.theme);
     Ok(())
 }
 

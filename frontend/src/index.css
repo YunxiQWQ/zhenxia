@@ -244,10 +244,10 @@
 .window-surface { background-color: hsl(var(--background)); }
 .window-surface[data-window-material="mica"] { background-color: hsl(var(--background) / 0.08); }
 .window-surface[data-window-material="acrylic"] { background-color: hsl(var(--background) / 0.58); }
-.pin-controls { position:absolute; right:8px; top:8px; display:flex; align-items:center; gap:4px; padding:5px; border-radius:9px; background:rgba(30,30,30,.96); color:#f4f4f5; border:1px solid rgba(255,255,255,.14); opacity:0; transition:opacity 120ms ease; }
+.pin-controls { position:absolute; right:8px; top:8px; display:flex; align-items:center; gap:4px; padding:5px; border-radius:9px; background:hsl(var(--popover) / .96); color:hsl(var(--popover-foreground)); border:1px solid hsl(var(--border)); opacity:0; transition:opacity 120ms ease; }
 .pin-surface:hover .pin-controls, .pin-surface:focus-within .pin-controls { opacity:1; }
 .pin-controls button { display:grid; place-items:center; width:27px; height:27px; border-radius:5px; }
-.pin-controls button:hover { background:rgba(255,255,255,.1); }
+.pin-controls button:hover { background:hsl(var(--foreground) / .1); }
 
 /* This fork uses immediate UI changes, including screenshot/pin entry and exit. */
 /* Let longer translated controls use their own line in narrower settings windows. */

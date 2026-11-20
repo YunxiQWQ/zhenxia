@@ -303,7 +303,7 @@ export function ImageTextViewer({
 
   const selectable = words.length > 0;
   const controlClass =
-    'rounded-md border border-white/[0.09] bg-black/50 p-1.5 text-foreground/85 backdrop-blur transition-colors hover:bg-black/70 disabled:opacity-40';
+    'rounded-md border border-border bg-popover/95 p-1.5 text-popover-foreground backdrop-blur hover:bg-popover disabled:opacity-40';
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
@@ -477,7 +477,7 @@ export function ImageTextViewer({
       {selection && (
         <div
           data-el="ocr-selection-bar"
-          className="pointer-events-auto absolute bottom-10 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-white/[0.12] bg-[#202023]/95 px-2 py-1.5 shadow-lg"
+          className="pointer-events-auto absolute bottom-10 left-1/2 flex -translate-x-1/2 items-center gap-2 rounded-lg border border-border bg-popover/95 px-2 py-1.5 text-popover-foreground shadow-lg"
         >
           <span className="max-w-[280px] truncate text-[11px] text-foreground/70">
             {selection.replace(/\n/g, ' ')}

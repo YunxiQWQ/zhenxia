@@ -631,6 +631,17 @@ pub fn capture_active() -> bool {
     CAPTURE_OPENING.load(Ordering::Acquire) || !desktop_sessions().lock().unwrap().is_empty()
 }
 
+/// The fullscreen selection needs an edge-to-edge overlay. The editor uses
+/// the same native host but is a normal app window with the user's material.
+pub(crate) fn desktop_selection_active() -> bool {
+    let sessions = desktop_sessions().lock().unwrap();
+    if sessions.is_empty() {
+        CAPTURE_OPENING.load(Ordering::Acquire)
+    } else {
+        sessions.values().any(|session| !session.is_edit)
+    }
+}
+
 async fn ensure_capture_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     app.get_webview_window(OVERLAY_LABEL).ok_or_else(|| "Main window unavailable".into())
 }

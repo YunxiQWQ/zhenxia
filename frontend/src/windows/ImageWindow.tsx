@@ -11,9 +11,7 @@ import {
   fullImageCopyState,
   fullImageCopyTitle,
 } from '../utils/clipRowPresentation';
-import { useSystemAccent } from '../hooks/useSystemAccent';
-import { useTheme } from '../hooks/useTheme';
-import { Settings } from '../types';
+import { useWindowAppearance } from '../hooks/useWindowAppearance';
 
 /**
  * A screenshot on its own, with room to breathe: opens at actual size so the
@@ -26,17 +24,9 @@ import { Settings } from '../types';
 export function ImageWindow() {
   const [details, setDetails] = useState<ClipDetails | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [settings, setSettings] = useState<Settings | null>(null);
-
-  const effectiveTheme = useTheme(settings?.theme ?? 'system');
-  // Each Tauri window is its own document and must apply the accent itself.
-  useSystemAccent();
+  const { effectiveTheme, material } = useWindowAppearance();
 
   const clipId = new URLSearchParams(window.location.search).get('clip');
-
-  useEffect(() => {
-    invoke<Settings>('get_settings').then(setSettings).catch(console.error);
-  }, []);
 
   useEffect(() => {
     if (!clipId) {
@@ -110,10 +100,13 @@ export function ImageWindow() {
 
   const imageSrc = details ? imageSrcFromContent(details.content) : null;
   const actionClass =
-    'inline-flex items-center gap-1.5 rounded-md border border-white/[0.09] bg-white/[0.05] px-2.5 py-1.5 text-[11px] font-medium text-foreground transition-colors enabled:hover:bg-white/[0.1] disabled:opacity-40';
+    'inline-flex items-center gap-1.5 rounded-md border border-border bg-foreground/5 px-2.5 py-1.5 text-[11px] font-medium text-foreground enabled:hover:bg-foreground/10 disabled:opacity-40';
 
   return (
-    <div className="flex h-screen select-none flex-col bg-background text-foreground">
+    <div
+      className="window-surface flex h-screen select-none flex-col text-foreground"
+      data-window-material={material}
+    >
       <header
         className="flex shrink-0 items-center justify-between border-b border-border px-4 py-2.5"
         onMouseDown={(event) => {

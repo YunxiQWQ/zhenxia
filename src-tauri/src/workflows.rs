@@ -81,7 +81,10 @@ pub(crate) fn show_controls(app:&AppHandle)->Result<(),String>{
         let _=w.set_position(tauri::PhysicalPosition::new(x,y));
     }
     #[cfg(windows)]if let Ok(h)=w.hwnd(){unsafe{use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity,WDA_EXCLUDEFROMCAPTURE};let _=SetWindowDisplayAffinity(windows::Win32::Foundation::HWND(h.0 as _),WDA_EXCLUDEFROMCAPTURE);}}
-    crate::window_presentation::refresh_shape(&w);CONTROL_READY.store(true,Ordering::Release);Ok(())
+    let preferences = app.state::<Arc<crate::settings_manager::SettingsManager>>().get();
+    crate::apply_window_appearance(&w, &preferences);
+    CONTROL_READY.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn control_origin(work:Region,region:Region,width:i32,height:i32)->(i32,i32){

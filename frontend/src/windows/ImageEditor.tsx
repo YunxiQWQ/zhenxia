@@ -63,9 +63,9 @@ import {
   transformDocument,
 } from '../editor/paint';
 import './image-editor.css';
-import { useCaptureSettings } from '../hooks/useCaptureSettings';
-import { shortcutAction } from '../utils/capturePreferences';
-import { toolbarColors } from '../components/CaptureToolbar';
+import { useSystemAccent } from '../hooks/useSystemAccent';
+import { shortcutAction, type CapturePreferences } from '../utils/capturePreferences';
+import type { WindowMaterial } from '../utils/windowMaterial';
 import { ScanText, ScanQrCode, Languages } from 'lucide-react';
 import { QrResultDialog } from '../components/QrResultDialog';
 
@@ -75,6 +75,8 @@ interface Props {
   sessionId: string;
   sourceClipId: string | null;
   onCancel: () => void;
+  preferences: CapturePreferences;
+  material: WindowMaterial;
 }
 interface Drag {
   kind: 'draw' | 'move' | 'resize' | 'crop' | 'pan';
@@ -118,9 +120,10 @@ export default function ImageEditor({
   sourceClipId,
   onCancel,
   initialWatermark = false,
+  preferences,
+  material,
 }: Props) {
-  const { preferences, systemTheme } = useCaptureSettings();
-  const palette = toolbarColors(preferences, systemTheme);
+  useSystemAccent();
   const [textResult, setTextResult] = useState<{ text: string; translated?: string | null } | null>(
     null
   );
@@ -742,17 +745,13 @@ export default function ImageEditor({
     resizeW * resizeH > 64000000;
   return (
     <div
-      className="image-editor"
+      className="window-surface image-editor"
+      data-window-material={material}
       data-testid="image-editor"
       aria-label={l('Image editor', '图片编辑器')}
     >
       <header
         className="ie-header"
-        style={{
-          background: palette.background,
-          color: palette.foreground,
-          borderColor: palette.border,
-        }}
         onPointerDown={(e) => {
           if (e.button === 0 && !(e.target as HTMLElement).closest('button'))
             void invoke('start_window_drag');
@@ -853,11 +852,7 @@ export default function ImageEditor({
         </div>
       </header>
       <div className="ie-body">
-        <nav
-          style={{ background: palette.background, color: palette.foreground }}
-          className="ie-tools"
-          aria-label={l('Editing tools', '编辑工具')}
-        >
+        <nav className="ie-tools" aria-label={l('Editing tools', '编辑工具')}>
           {tools
             .filter((t) => !preferences.toolbar_hidden.includes(t.id as never) || t.id === 'select')
             .sort((a, b) => {

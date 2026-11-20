@@ -7,9 +7,15 @@ pub fn refresh_shape(window: &tauri::WebviewWindow) {
     let _ = window.run_on_main_thread(move || refresh_shape_on_ui_thread(&target));
 }
 
-fn is_custom_surface(label: &str) -> bool {
-    matches!(label, "main" | "settings" | "translation" | "image" | "workflow" | "presentation")
+pub(crate) fn is_custom_surface(label: &str) -> bool {
+    has_material_frame(label) || label == "presentation"
         || label.starts_with("zhenxia-pin-")
+}
+
+/// These windows draw full app panels. The transparent presentation canvas
+/// and pinned image itself need to keep their clear pixels.
+pub(crate) fn has_material_frame(label: &str) -> bool {
+    matches!(label, "main" | "settings" | "translation" | "image" | "workflow")
 }
 
 /// Wait for the native frame to be removed before a new surface is first shown.
@@ -76,9 +82,9 @@ fn refresh_shape_on_ui_thread(window: &tauri::WebviewWindow) {
         use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND};
         use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongW, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE};
 
-        let capturing = (window.label() == "main" && crate::zhenxia::capture_active())
+        let capturing = (window.label() == "main" && crate::zhenxia::desktop_selection_active())
             || window.label() == "presentation";
-        let frame_hints = matches!(window.label(), "main" | "settings" | "translation") && !capturing;
+        let frame_hints = has_material_frame(window.label()) && !capturing;
         let rounded = window.state::<Arc<SettingsManager>>().get().round_corners
             && !capturing;
         let hwnd = HWND(handle.0 as _);
@@ -129,6 +135,15 @@ mod tests {
     fn all_custom_surfaces_use_the_frame_policy() {
         for label in ["main", "settings", "translation", "image", "workflow", "presentation", "zhenxia-pin-123"] { assert!(is_custom_surface(label)); }
         assert!(!is_custom_surface("system-file-dialog"));
+    }
+    #[test]
+    fn backdrops_apply_to_panels_but_not_images_pinned_to_the_desktop_or_canvases() {
+        for label in ["main", "settings", "translation", "image", "workflow"] {
+            assert!(has_material_frame(label));
+        }
+        for label in ["presentation", "zhenxia-pin-123", "system-file-dialog"] {
+            assert!(!has_material_frame(label));
+        }
     }
     #[test]
     fn drag_coordinates_pack_signed_monitor_positions_instead_of_addresses() {

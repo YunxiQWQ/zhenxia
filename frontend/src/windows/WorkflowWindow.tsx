@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { X, Square, Pause, Play, Camera, GripHorizontal } from 'lucide-react';
 import { useTranslation } from '../i18n';
+import { useWindowAppearance } from '../hooks/useWindowAppearance';
 interface Status {
   kind: string;
   width?: number;
@@ -19,6 +20,7 @@ interface Status {
   elapsed?: number;
 }
 export function WorkflowWindow() {
+  const { material } = useWindowAppearance();
   const { lang } = useTranslation(),
     t = (cn: string, en: string) => (lang === 'zh-CN' ? cn : en);
   const [status, setStatus] = useState<Status>({ kind: 'none' }),
@@ -65,8 +67,9 @@ export function WorkflowWindow() {
   };
   return (
     <main
-      className="flex h-screen flex-col overflow-hidden rounded-xl border border-border bg-background/95 p-3 text-foreground"
+      className="window-surface flex h-screen flex-col overflow-hidden border border-border p-3 text-foreground"
       data-el="workflow-controls"
+      data-window-material={material}
     >
       <header
         className="mb-3 flex cursor-move items-center justify-between border-b border-border pb-2"
@@ -102,7 +105,7 @@ export function WorkflowWindow() {
               'Scroll down in the source app. Keep at least half of each frame overlapping.'
             )}
           </p>
-          <div className="flex min-h-0 flex-1 justify-center overflow-hidden rounded-lg bg-black/10">
+          <div className="flex min-h-0 flex-1 justify-center overflow-hidden rounded-lg bg-secondary/35">
             {status.preview && (
               <img
                 className="h-full max-w-full object-contain"

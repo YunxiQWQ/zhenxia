@@ -9,6 +9,7 @@ import { CAPTURE_ACTIONS, shortcutAction, type CaptureAction } from '../utils/ca
 import { flushSync } from 'react-dom';
 import { decodeCaptureBitmap } from '../utils/captureBitmap';
 import { readCapturePixels } from '../utils/captureSharedPixels';
+import { windowMaterial } from '../utils/windowMaterial';
 
 // The full editor loads only when opening a history image; F1 stays on its
 // existing capture path and shares the original native window.
@@ -99,7 +100,7 @@ const WIDTHS = [2, 4, 6, 10];
 
 // ── Component ──────────────────────────────────────────────────────────────
 export function CaptureOverlay() {
-  const { preferences, systemTheme } = useCaptureSettings();
+  const { settings, preferences, systemTheme } = useCaptureSettings();
   const [redoStack, setRedoStack] = useState<AnnotationElement[][]>([]);
   const [result, setResult] = useState<{ text: string; translated?: string | null } | null>(null);
   const [qrCodes, setQrCodes] = useState<string[] | null>(null);
@@ -886,9 +887,12 @@ export function CaptureOverlay() {
   })();
 
   // ── Render ───────────────────────────────────────────────────────────────
+  const editorMaterial = windowMaterial(settings?.mica_effect);
   if (session?.is_edit && imageEl) {
     return (
-      <Suspense fallback={<div className="h-screen bg-[#1e1e1e]" />}>
+      <Suspense
+        fallback={<div className="window-surface h-screen" data-window-material={editorMaterial} />}
+      >
         <ImageEditor
           initialWatermark={watermarkRequested}
           key={session.session_id}
@@ -896,6 +900,8 @@ export function CaptureOverlay() {
           sessionId={session.session_id}
           sourceClipId={session.parent_clip_id}
           onCancel={() => void handleCancel()}
+          preferences={preferences}
+          material={editorMaterial}
         />
       </Suspense>
     );
@@ -917,8 +923,9 @@ export function CaptureOverlay() {
   return (
     <div
       ref={containerRef}
-      className="relative h-screen w-full select-none overflow-hidden"
-      style={{ cursor: 'crosshair', background: session?.is_edit ? '#1e1e1e' : 'transparent' }}
+      className={`relative h-screen w-full select-none overflow-hidden${session.is_edit ? ' window-surface' : ''}`}
+      data-window-material={session.is_edit ? editorMaterial : undefined}
+      style={{ cursor: 'crosshair' }}
     >
       {/* Frozen desktop */}
       <canvas ref={canvasRef} className="absolute" style={bounds} />

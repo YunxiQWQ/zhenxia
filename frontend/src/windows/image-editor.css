@@ -1,22 +1,24 @@
 .image-editor {
-  --ie-bg: #1e1e1e;
-  --ie-panel: #252525;
-  --ie-border: #ffffff14;
-  --ie-muted: #999;
+  --ie-panel: hsl(var(--secondary) / 0.35);
+  --ie-border: hsl(var(--border));
+  --ie-muted: hsl(var(--muted-foreground));
+  --ie-fg: hsl(var(--foreground));
   --ie-accent: hsl(var(--primary));
+  --ie-input: hsl(var(--foreground) / 0.045);
+  --ie-hover: hsl(var(--foreground) / 0.08);
+  --ie-selected: hsl(var(--foreground) / 0.12);
+  --ie-float: hsl(var(--popover));
   display: flex;
   flex-direction: column;
   width: 100%;
   height: 100dvh;
   overflow: hidden;
-  background: var(--ie-bg);
-  color: #ededed;
+  color: var(--ie-fg);
   font:
     12px/1.5 'Segoe UI',
     'Microsoft YaHei',
     sans-serif;
   user-select: none;
-  color-scheme: dark;
 }
 .image-editor * {
   box-sizing: border-box;
@@ -68,9 +70,9 @@
   width: 35px;
   height: 35px;
   border-radius: 10px;
-  background: #ffffff08;
-  border: 1px solid #ffffff12;
-  color: #b4d6f4;
+  background: var(--ie-input);
+  border: 1px solid var(--ie-border);
+  color: var(--ie-accent);
 }
 .ie-brand strong {
   display: block;
@@ -84,7 +86,7 @@
 }
 .ie-brand i {
   font-style: normal;
-  color: #555;
+  color: var(--ie-muted);
   margin: 0 5px;
 }
 .ie-unsaved {
@@ -105,13 +107,13 @@
   width: 31px;
   height: 31px;
   border-radius: 6px;
-  color: #bcbcbc;
+  color: var(--ie-muted);
   background: transparent;
   border: 1px solid transparent;
 }
 .image-editor button:hover:not(:disabled) {
-  background-color: #ffffff0d;
-  color: #fff;
+  background-color: var(--ie-hover);
+  color: var(--ie-fg);
 }
 .ie-divider {
   height: 17px;
@@ -122,16 +124,16 @@
 }
 .ie-button {
   height: 31px;
-  border: 1px solid #ffffff18;
+  border: 1px solid var(--ie-border);
   border-radius: 6px;
   padding: 0 10px;
-  background: #ffffff06;
+  background: var(--ie-input);
   white-space: nowrap;
   font-size: 11px !important;
 }
 .image-editor .ie-primary {
   background: var(--ie-accent);
-  color: #fff;
+  color: hsl(var(--primary-foreground));
   border-color: transparent;
 }
 .image-editor .ie-primary:hover:not(:disabled) {
@@ -140,6 +142,7 @@
 }
 .ie-close:hover:not(:disabled) {
   background: #c42b1c !important;
+  color: white;
 }
 .ie-body {
   display: flex;
@@ -159,7 +162,7 @@
   height: 45px;
   flex-direction: column;
   gap: 2px !important;
-  color: #acacac;
+  color: var(--ie-muted);
   border-radius: 7px;
   margin: 1px 0;
   border: 1px solid transparent;
@@ -168,9 +171,9 @@
   font-size: 9px;
 }
 .ie-tool.is-active {
-  color: #fff;
-  border-color: #ffffff1a;
-  background: #ffffff0b;
+  color: var(--ie-fg);
+  border-color: var(--ie-border);
+  background: var(--ie-selected);
   position: relative;
 }
 .ie-tool.is-active::before {
@@ -200,17 +203,17 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-bottom: 1px solid #ffffff09;
+  border-bottom: 1px solid var(--ie-border);
 }
 .ie-contextbar > span {
   display: flex;
   align-items: center;
   gap: 7px;
-  color: #c5c5c5;
+  color: var(--ie-fg);
   font-size: 11px;
 }
 .ie-contextbar small {
-  color: #999;
+  color: var(--ie-muted);
 }
 .ie-contextbar .ie-icon {
   width: 28px;
@@ -222,8 +225,8 @@
   flex: 1;
   overflow: hidden;
   touch-action: none;
-  background-color: #171717;
-  background-image: radial-gradient(#ffffff0c 0.8px, transparent 0.8px);
+  background-color: var(--ie-panel);
+  background-image: radial-gradient(var(--ie-hover) 0.8px, transparent 0.8px);
   background-size: 15px 15px;
 }
 .ie-paper {
@@ -233,7 +236,7 @@
   background-size: 16px 16px;
   box-shadow:
     0 4px 28px #0005,
-    0 0 0 1px #ffffff12;
+    0 0 0 1px var(--ie-border);
   pointer-events: none;
 }
 .ie-paper canvas {
@@ -252,13 +255,13 @@
   align-items: center;
   gap: 2px;
   padding: 3px 7px;
-  border: 1px solid #ffffff18;
+  border: 1px solid var(--ie-border);
   border-radius: 9px;
-  background: #292929;
+  background: var(--ie-float);
   box-shadow: 0 4px 15px #0004;
 }
 .ie-zoom-percent {
-  color: #d8d8d8;
+  color: var(--ie-fg);
   min-width: 43px;
   height: 27px;
   border-radius: 4px;
@@ -273,7 +276,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  color: #8b8b8b;
+  color: var(--ie-muted);
   font-size: 10px;
   border-top: 1px solid var(--ie-border);
 }
@@ -298,7 +301,7 @@
   width: 220px;
   flex-shrink: 0;
   border-left: 1px solid var(--ie-border);
-  background: #222;
+  background: var(--ie-panel);
   overflow-y: auto;
   scrollbar-width: thin;
   display: flex;
@@ -317,7 +320,7 @@
   justify-content: space-between;
 }
 .ie-properties h3 small {
-  color: #888;
+  color: var(--ie-muted);
   font-size: 10px;
   font-weight: 400;
 }
@@ -326,17 +329,17 @@
   justify-content: space-between;
   align-items: center;
   font-size: 11px;
-  color: #bbb;
+  color: var(--ie-fg);
   margin: 13px 0 9px;
 }
 .ie-properties input[type='number'],
 .ie-properties select {
-  background: #ffffff06;
-  border: 1px solid #ffffff16;
+  background: var(--ie-input);
+  border: 1px solid var(--ie-border);
   border-radius: 5px;
   height: 28px;
   padding: 2px 7px;
-  color: #ddd;
+  color: var(--ie-fg);
   min-width: 0;
 }
 .ie-properties input[type='number'] {
@@ -355,7 +358,7 @@
   width: 28px;
   height: 20px;
   padding: 2px;
-  border: 1px solid #ffffff30;
+  border: 1px solid var(--ie-border);
   border-radius: 4px;
   background: transparent;
   cursor: pointer;
@@ -369,10 +372,10 @@
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  border: 1px solid #ffffff30;
+  border: 1px solid var(--ie-border);
 }
 .ie-colors button.is-active {
-  outline: 1px solid #ddd;
+  outline: 1px solid var(--ie-fg);
   outline-offset: 3px;
 }
 .ie-range {
@@ -386,14 +389,14 @@
   margin-top: 8px;
 }
 .ie-button.is-active {
-  background: #ffffff14;
-  border-color: #ffffff40;
+  background: var(--ie-selected);
+  border-color: var(--ie-border);
 }
 .ie-checkbox {
   display: flex;
   align-items: center;
   gap: 7px;
-  color: #aaa;
+  color: var(--ie-muted);
   font-size: 10px;
   margin-top: 11px;
 }
@@ -403,7 +406,7 @@
   height: 12px;
 }
 .ie-properties p {
-  color: #808080;
+  color: var(--ie-muted);
   font-size: 10px;
   line-height: 1.8;
   margin: 12px 0 0;
@@ -424,7 +427,7 @@
   align-items: center;
   gap: 5px;
   font-size: 10px;
-  color: #777;
+  color: var(--ie-muted);
 }
 .ie-dimensions input {
   width: 65px !important;
@@ -445,12 +448,12 @@
   text-align: left;
   padding: 7px 6px;
   border-radius: 4px;
-  color: #aaa;
+  color: var(--ie-muted);
   gap: 8px;
 }
 .ie-layers > button.is-active {
-  background: #ffffff0c;
-  color: #eee;
+  background: var(--ie-selected);
+  color: var(--ie-fg);
 }
 .ie-layers > button > span:first-of-type {
   flex: 1;
@@ -470,7 +473,7 @@
   display: flex;
   align-items: center;
   flex-direction: column;
-  color: #555;
+  color: var(--ie-muted);
 }
 .ie-empty p {
   margin-top: 7px;
@@ -480,14 +483,14 @@
   align-items: center;
   gap: 6px;
   padding: 12px 16px;
-  color: #777;
+  color: var(--ie-muted);
   font-size: 9px;
 }
 .ie-text-edit {
   position: absolute;
   z-index: 5;
-  background: #262626;
-  border: 1px solid #90bff7;
+  background: var(--ie-float);
+  border: 1px solid var(--ie-accent);
   box-shadow: 0 4px 20px #0005;
   border-radius: 4px;
   min-width: 190px;
@@ -514,7 +517,7 @@
 }
 .ie-text-edit small {
   font-size: 9px;
-  color: #888;
+  color: var(--ie-muted);
   flex: 1;
 }
 .ie-text-edit button {
@@ -531,14 +534,14 @@
   align-items: center;
   gap: 6px;
   padding: 5px 7px;
-  border: 1px solid #ffffff20;
+  border: 1px solid var(--ie-border);
   border-radius: 6px;
-  background: #292929;
+  background: var(--ie-float);
   white-space: nowrap;
 }
 .ie-crop-actions span {
   padding: 0 10px;
-  color: #bbb;
+  color: var(--ie-muted);
   font-size: 11px;
 }
 .ie-crop-actions button {
@@ -556,8 +559,9 @@
   justify-content: space-between;
   gap: 12px;
   padding: 12px;
-  background: #562323;
-  border: 1px solid #c46363;
+  background: var(--ie-float);
+  border: 1px solid hsl(var(--destructive));
+  color: hsl(var(--destructive));
   border-radius: 5px;
   z-index: 50;
   overflow-wrap: anywhere;
@@ -572,15 +576,15 @@
 }
 .ie-modal {
   padding: 26px;
-  background: #272727;
-  border: 1px solid #ffffff20;
+  background: var(--ie-float);
+  border: 1px solid var(--ie-border);
   border-radius: 10px;
   width: 440px;
   max-width: 95vw;
   box-shadow: 0 15px 55px #0007;
 }
 .ie-modal > svg {
-  color: #a8b9c7;
+  color: var(--ie-muted);
 }
 .ie-modal h2 {
   font-size: 17px;
@@ -588,7 +592,7 @@
   margin: 14px 0 8px;
 }
 .ie-modal p {
-  color: #aaa;
+  color: var(--ie-muted);
   font-size: 12px;
   line-height: 1.9;
 }

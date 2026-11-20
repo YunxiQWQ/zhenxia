@@ -5,6 +5,7 @@ import { LogicalSize } from '@tauri-apps/api/dpi';
 import { Pin, PinOff, Copy, Save, X, Pencil } from 'lucide-react';
 import { useTranslation } from '../i18n';
 import { useCaptureSettings } from '../hooks/useCaptureSettings';
+import { useSystemAccent } from '../hooks/useSystemAccent';
 import { shortcutAction } from '../utils/capturePreferences';
 
 interface Payload {
@@ -15,6 +16,7 @@ interface Payload {
 }
 export function PinWindow() {
   const { settings, preferences } = useCaptureSettings();
+  useSystemAccent();
   const opacityInitialized = useRef(false);
   useEffect(() => {
     if (settings && !opacityInitialized.current) {
@@ -141,9 +143,9 @@ export function PinWindow() {
           value={opacity}
           onChange={(e) => setOpacity(Number(e.target.value))}
           aria-label={t('Opacity')}
-          className="w-16 accent-violet-400"
+          className="w-16 accent-primary"
         />
-        <span className="h-4 w-px bg-white/15" />
+        <span className="h-4 w-px bg-border" />
         <button
           title={top ? t('Unpin from top') : t('Always on top')}
           aria-label={top ? t('Unpin from top') : t('Always on top')}

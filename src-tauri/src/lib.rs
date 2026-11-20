@@ -262,32 +262,23 @@ pub fn run_app() {
                         window_presentation::refresh_shape(&view);
                     }
                 }
-                tauri::WindowEvent::ThemeChanged(theme) => {
-                    let _=tauri::Emitter::emit(window.app_handle(),"system-theme-changed",settings_commands::get_system_theme());
-                    log::info!("THEME:System theme changed to: {:?}, win.theme(): {:?}", theme, window.theme());
+                tauri::WindowEvent::ThemeChanged(_) => {
+                    let system_theme = settings_commands::get_system_theme();
+                    let _ = tauri::Emitter::emit(window.app_handle(), "system-theme-changed", system_theme);
                     let label = window.label().to_string();
                     let app_handle = window.app_handle().clone();
-                    let theme_ = *theme;
 
-                    // Update tray icon to match new system theme
                     if let Some(tray) = app_handle.tray_by_id("main") {
-                        update_tray_icon(&tray, &theme_);
+                        let theme = if system_theme == "dark" { tauri::Theme::Dark } else { tauri::Theme::Light };
+                        update_tray_icon(&tray, &theme);
                     }
 
-                    // Use SettingsManager
-                    let manager = window.state::<Arc<SettingsManager>>();
-                    let settings = manager.get();
-
                     tauri::async_runtime::spawn(async move {
-                        let current_theme = settings.theme;
-                        let mica_effect = settings.mica_effect;
-                        let round_corners = settings.round_corners;
-
-                        log::info!("THEME:Re-applying window effect due to theme change. Current theme setting: {:?}, system theme: {:?}, mica_effect setting: {:?}", current_theme, theme_, mica_effect);
-                        // If app is set to follow system, we re-apply based on the NEW system theme
-                        if current_theme == "system" {
+                        let Some(manager) = app_handle.try_state::<Arc<SettingsManager>>() else { return; };
+                        let settings = manager.get();
+                        if settings.theme == "system" && window_presentation::has_material_frame(&label) {
                             if let Some(webview_win) = app_handle.get_webview_window(&label) {
-                                crate::apply_window_effect(&webview_win, &mica_effect, &theme_, round_corners);
+                                apply_window_appearance(&webview_win, &settings);
                             }
                         }
                     });
@@ -406,26 +397,7 @@ pub fn run_app() {
 
             {
                 let manager = app_handle.state::<Arc<SettingsManager>>();
-                let settings = manager.get();
-                let mica_effect = settings.mica_effect;
-                let theme = settings.theme;
-                let round_corners = settings.round_corners;
-
-                // get current system theme
-                let current_theme = if theme == "light" {
-                    tauri::Theme::Light
-                } else if theme == "dark" {
-                    tauri::Theme::Dark
-                } else {
-                    win.theme().unwrap_or_else(|err| {
-                        log::error!("THEME:Failed to get system theme: {:?}, defaulting to Light", err);
-                        tauri::Theme::Light
-                    })
-                };
-
-                log::info!("THEME:Applying window effect: {} with theme: {:?} (setting:{:?})", mica_effect, current_theme, theme);
-
-                crate::apply_window_effect(&win, &mica_effect, &current_theme, round_corners);
+                apply_window_appearance(&win, &manager.get());
             }
 
             let manager = app_handle.state::<Arc<SettingsManager>>();
@@ -1405,28 +1377,32 @@ pub fn get_monitor_at_cursor(window: &tauri::WebviewWindow) -> Option<tauri::Mon
     found.or_else(|| window.current_monitor().ok().flatten())
 }
 
-pub fn apply_window_effect(
+pub(crate) fn apply_window_appearance(
     window: &tauri::WebviewWindow,
-    effect: &str,
-    theme: &tauri::Theme,
-    round_corners: bool,
+    settings: &crate::models::AppSettings,
 ) {
-    log::info!(
-        "THEME:apply_window_effect called: effect={}, theme={:?}, round_corners={}",
-        effect,
-        theme,
-        round_corners
-    );
     use window_vibrancy::{apply_acrylic, apply_mica, clear_acrylic, clear_mica, clear_tabbed};
 
-    // Keep WebView2's preferred color scheme and the native DWM material on the
-    // same resolved theme. This is especially important for Acrylic, whose
-    // Windows 11 transient backdrop otherwise may remain light while Cubby is dark.
-    if let Err(error) = window.set_theme(Some(*theme)) {
-        log::error!("THEME:Failed to set resolved window theme: {:?}", error);
+    let preference = match settings.theme.as_str() {
+        "light" => Some(tauri::Theme::Light),
+        "dark" => Some(tauri::Theme::Dark),
+        _ => None,
+    };
+    // A forced theme stops Tao's notifications when Windows changes theme.
+    // System mode needs those notifications even during a hidden session.
+    if let Err(error) = window.set_theme(preference) {
+        log::error!("THEME:Failed to set window theme: {error}");
     }
+    if !window_presentation::has_material_frame(window.label()) {
+        window_presentation::refresh_shape(window);
+        return;
+    }
+    let theme = preference.unwrap_or_else(|| match settings_commands::get_system_theme() {
+        "dark" => tauri::Theme::Dark,
+        _ => tauri::Theme::Light,
+    });
 
-    match effect {
+    match settings.mica_effect.as_str() {
         "solid" | "clear" => {
             if let Err(e) = clear_acrylic(window) {
                 log::error!("THEME:Failed to clear acrylic: {:?}", e);
@@ -1531,29 +1507,6 @@ pub fn apply_window_effect(
                 log::error!("THEME:Failed to clear tabbed: {:?}", e);
             }
             log::info!("THEME:Unknown window effect; using solid mode");
-        }
-    }
-
-    // Keep the native window shape aligned with the frontend frame.
-    let use_rounded = round_corners;
-    if let Ok(handle) = window.hwnd() {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::Graphics::Dwm::{
-            DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
-        };
-        let hwnd = HWND(handle.0 as _);
-        let corner_pref = if use_rounded {
-            DWMWCP_ROUND.0
-        } else {
-            DWMWCP_DONOTROUND.0
-        };
-        unsafe {
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &corner_pref as *const _ as *const _,
-                std::mem::size_of::<u32>() as u32,
-            );
         }
     }
 

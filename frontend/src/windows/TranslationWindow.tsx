@@ -3,19 +3,12 @@ import { emit } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { X } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
-import { useState } from 'react';
-import type { Settings } from '../types';
-import { useCaptureSettings } from '../hooks/useCaptureSettings';
-import { useSystemAccent } from '../hooks/useSystemAccent';
+import { useWindowAppearance } from '../hooks/useWindowAppearance';
 import { TranslationPane } from '../components/settings/TranslationPane';
-import { windowMaterial } from '../utils/windowMaterial';
 import { useTranslation } from '../i18n';
 export function TranslationWindow() {
-  const { settings, effectiveTheme } = useCaptureSettings();
-  const [override, setOverride] = useState<Settings | null>(null);
-  useSystemAccent();
+  const { settings: current, effectiveTheme, material } = useWindowAppearance();
   const { lang } = useTranslation();
-  const current = override ?? settings;
   if (!current)
     return (
       <div role="status" className="p-8">
@@ -25,7 +18,7 @@ export function TranslationWindow() {
   return (
     <div
       className="window-surface flex h-screen flex-col text-foreground"
-      data-window-material={windowMaterial(current.mica_effect)}
+      data-window-material={material}
     >
       <header
         className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3"
@@ -47,10 +40,7 @@ export function TranslationWindow() {
           updateSetting={(key, value) => {
             const next = { ...current, [key]: value };
             void invoke('save_settings', { settings: next, changedKeys: [key] })
-              .then(async () => {
-                setOverride(next);
-                await emit('settings-changed', next);
-              })
+              .then(() => emit('settings-changed', next))
               .catch((e) => toast.error(String(e)));
           }}
         />

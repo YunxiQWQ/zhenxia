@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { useTranslation } from '../i18n';
+import { useWindowAppearance } from '../hooks/useWindowAppearance';
 interface Stroke {
   points: { x: number; y: number }[];
   color: string;
@@ -10,6 +11,7 @@ interface Stroke {
   created: number;
 }
 export function PresentationWindow() {
+  useWindowAppearance();
   const { lang } = useTranslation(),
     t = (cn: string, en: string) => (lang === 'zh-CN' ? cn : en);
   const canvas = useRef<HTMLCanvasElement>(null),
@@ -122,7 +124,7 @@ export function PresentationWindow() {
           drawing.current = null;
         }}
       />
-      <div className="absolute left-1/2 top-4 flex max-w-[96vw] -translate-x-1/2 flex-wrap items-center gap-2 rounded-xl border border-border bg-background/95 p-2 text-xs text-foreground shadow-lg">
+      <div className="absolute left-1/2 top-4 flex max-w-[96vw] -translate-x-1/2 flex-wrap items-center gap-2 rounded-xl border border-border bg-popover/95 p-2 text-xs text-popover-foreground shadow-lg">
         <strong className="px-2">{t('演示画布', 'Presentation')}</strong>
         <input
           aria-label={t('颜色', 'Color')}
