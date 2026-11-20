@@ -2,11 +2,11 @@
 
 Windows 剪贴板历史、截图与标注工具。以 Cubby 为主体，整合 LaterScreen Rust 引擎，并参考轻雪的截图与贴图工作流。
 
-**当前版本：0.2.4。** 支持中文和英文。[更新说明](https://github.com/YunxiQWQ/zhenxia/blob/main/docs/RELEASE-0.2.4.md)。项目仍在完善，已有功能不代表与轻雪的全部能力一致。
+**当前版本：0.2.6。** 支持中文和英文。[更新说明](https://github.com/YunxiQWQ/zhenxia/blob/main/docs/RELEASE-0.2.6.md)。项目仍在完善，已有功能不代表与轻雪的全部能力一致。
 
 ## 下载与运行
 
-从 [v0.2.4 Releases](https://github.com/YunxiQWQ/zhenxia/releases/tag/v0.2.4) 下载安装版 `Zhenxia-0.2.4-windows-x64-setup.exe`，安装后可在“设置 → 常规 → 开机启动”开启登录 Windows 时自动运行。默认不自动开启。安装版数据保存在 `%APPDATA%\Zhenxia`，卸载保留历史数据。
+从 [v0.2.6 Releases](https://github.com/YunxiQWQ/zhenxia/releases/tag/v0.2.6) 下载安装版 `Zhenxia-0.2.6-windows-x64-setup.exe`，安装后可在“设置 → 常规 → 开机启动”开启登录 Windows 时自动运行。默认不自动开启。安装版数据保存在 `%APPDATA%\Zhenxia`，卸载保留历史数据。
 
 也可下载 Windows x64 便携包，解压后运行 `Zhenxia.exe`。便携版的开机启动设置保持禁用；需要开机启动请使用安装版。保留同目录的 `portable.txt` 和 `data`；更新时退出程序、替换程序文件，保留原 `data`。不要同时运行多个替代 Win+V 的剪贴板程序。
 
@@ -15,7 +15,7 @@ Windows 剪贴板历史、截图与标注工具。以 Cubby 为主体，整合 L
 ## 主要功能
 
 - **统一剪贴板历史**：默认 480×580 紧凑面板，点击记录查看详情，顶部采用 Cubby 风格的搜索与分类；Win+V、文字/图片/文件筛选、搜索、备注、置顶和图片编辑。
-- **截图与标注**：默认 F1 框选，松手确定；矩形、箭头、画笔、文字、序号、高亮、马赛克，支持保存、复制和贴图。
+- **截图与标注**：默认 F1 框选，松手确定。支持矩形、箭头、画笔、文字、序号、高亮和马赛克，可保存为 PNG 或 JPG，也可直接复制和贴图。
 - **长截图**：从托盘或历史面板的“截图工具”进入，框选后向下滚动，程序自动捕获和拼接。也可开启自动滚动：两秒内将鼠标移入原选区，移出或切换窗口即暂停。到底/连续无变化停止采集；匹配失败暂停并保留已有结果。支持撤销、编辑和历史。限高 30000 像素且最多 4800 万像素。
 - **录屏**：选择区域后录制 MP4 或 GIF，支持暂停、继续、取消和停止保存。**当前只录屏幕画面，不录音频**。完成后在“设置 → 截图历史 → 录屏”导出。单次最多 30 分钟或 512 MB，GIF 区域最多约 210 万像素。
 - 录屏优先通过 MIT 许可的 [windows-capture 2.0.1](https://github.com/NiiightmareXD/windows-capture) 使用 Windows Graphics Capture；不可用时退回兼容捕获。MP4 默认 30 FPS，GIF 默认 12 FPS；实际帧率受分辨率和编码负载影响。采集资源随录屏结束释放。
