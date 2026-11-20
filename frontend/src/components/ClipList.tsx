@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ClipboardItem } from '../types';
 import { ClipCard } from './ClipCard';
 import { AlertCircle, RefreshCw } from 'lucide-react';
@@ -75,6 +75,9 @@ export function ClipList({
   active = true,
 }: ClipListProps) {
   const listRef = useRef<HTMLDivElement>(null);
+  const [nearViewport, setNearViewport] = useState<ReadonlySet<string>>(() => new Set());
+  const canObserve = typeof IntersectionObserver !== 'undefined';
+  const errorSurface = clipListErrorSurface(loadError, clips.length);
   // Arrow-key navigation can scroll a card under a stationary cursor and fire
   // mouseenter. A mousemove, including the first one after opening the flyout,
   // is direct evidence of pointer intent and may safely change selection.
@@ -91,6 +94,38 @@ export function ClipList({
       ?.querySelector<HTMLElement>(`[data-clip-id="${CSS.escape(selectedClipId)}"]`)
       ?.scrollIntoView({ block: 'nearest' });
   }, [selectedClipId]);
+
+  useEffect(() => {
+    const list = listRef.current;
+    if (!active || !canObserve || !list) return;
+    const images = list.querySelectorAll<HTMLElement>('[data-clip-type="image"]');
+    // The thumbnails have fixed-size placeholders. Watch their rows so a
+    // previously loaded page never decodes every image again when reopened.
+    const visible = new Set<string>();
+    let observing = true;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!observing) return;
+        for (const entry of entries) {
+          const id = (entry.target as HTMLElement).dataset.clipId;
+          if (!id) continue;
+          if (entry.isIntersecting) visible.add(id);
+          else visible.delete(id);
+        }
+        setNearViewport((previous) =>
+          previous.size === visible.size && [...visible].every((id) => previous.has(id))
+            ? previous
+            : new Set(visible)
+        );
+      },
+      { root: list, rootMargin: '120px 0px' }
+    );
+    images.forEach((row) => observer.observe(row));
+    return () => {
+      observing = false;
+      observer.disconnect();
+    };
+  }, [active, canObserve, clips, errorSurface]);
 
   const handleListKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     // Interactive descendants keep their native key handling. Only the
@@ -118,8 +153,6 @@ export function ClipList({
       </div>
     );
   }
-
-  const errorSurface = clipListErrorSurface(loadError, clips.length);
 
   if (errorSurface === 'panel') {
     return (
@@ -192,6 +225,7 @@ export function ClipList({
         {clips.map((clip, index) => (
           <ClipCard
             active={active}
+            loadThumbnail={!canObserve || nearViewport.has(clip.id)}
             key={clip.id}
             clip={clip}
             density={density}

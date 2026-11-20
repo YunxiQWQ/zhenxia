@@ -449,12 +449,13 @@ async fn collect_readable_clips_by_id(
     ids: &[String],
     source_start: usize,
     limit: usize,
+    include_ocr_words: bool,
 ) -> Result<Vec<Clip>, String> {
     collect_readable_clips(db, source_start, limit, |start, count| async move {
         let end = start.saturating_add(count).min(ids.len());
         let chunk = ids.get(start..end).unwrap_or_default();
         Ok(ClipBatch {
-            rows: fetch_clips_by_id(&db.pool, chunk).await?,
+            rows: fetch_clips_by_id(&db.pool, chunk, include_ocr_words).await?,
             exhausted: end >= ids.len(),
         })
     })
@@ -849,6 +850,13 @@ fn date_range_clause(from: Option<&str>, to: Option<&str>) -> String {
     clause
 }
 
+// Ordinary list rows only need to know if recognized text exists. The word
+// layout can be much larger than the thumbnail on text-heavy screenshots and
+// is only used when drawing search highlights or showing image details.
+const CLIP_LIST_COLUMNS: &str = "id, uuid, clip_type, content, text_preview, content_hash, \
+    folder_id, is_deleted, is_pinned, is_thumbnail, source_app, source_icon, metadata, \
+    ocr_text, NULL AS ocr_words, full_image_expired, notes, is_hidden, created_at, last_accessed";
+
 /// Load a page of clips by id, still ordered the way the database ordered them.
 /// Used by every path that has to narrow ids outside SQL (search, source app)
 /// before fetching the encrypted payloads for just the rows being shown.
@@ -861,15 +869,20 @@ fn date_range_clause(from: Option<&str>, to: Option<&str>) -> String {
 /// it, so without a deterministic tie-break the second ordering could disagree
 /// with the first and a row could be repeated on one page and missing from the
 /// next.
-async fn fetch_clips_by_id(pool: &SqlitePool, ids: &[String]) -> Result<Vec<Clip>, String> {
+async fn fetch_clips_by_id(
+    pool: &SqlitePool,
+    ids: &[String],
+    include_ocr_words: bool,
+) -> Result<Vec<Clip>, String> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let placeholders = std::iter::repeat_n("?", ids.len())
         .collect::<Vec<_>>()
         .join(",");
+    let columns = if include_ocr_words { "*" } else { CLIP_LIST_COLUMNS };
     let sql = format!(
-        "SELECT * FROM clips WHERE is_deleted = 0 AND uuid IN ({placeholders}) \
+        "SELECT {columns} FROM clips WHERE is_deleted = 0 AND uuid IN ({placeholders}) \
          ORDER BY is_pinned DESC, created_at DESC, uuid DESC"
     );
     let mut query = sqlx::query_as::<_, Clip>(&sql);
@@ -1099,7 +1112,8 @@ async fn get_clips_paged(
                 .collect();
             let source_start =
                 source_start_for_ids(&matching, after_id.as_deref(), requested_offset);
-            collect_readable_clips_by_id(db, &matching, source_start, requested_limit).await?
+            collect_readable_clips_by_id(db, &matching, source_start, requested_limit, false)
+                .await?
         }
     } else {
         let source_start = if after_id.is_some() {
@@ -1116,7 +1130,7 @@ async fn get_clips_paged(
             requested_offset
         };
         let list_sql = format!(
-            "SELECT * FROM clips WHERE {where_body} \
+            "SELECT {CLIP_LIST_COLUMNS} FROM clips WHERE {where_body} \
              ORDER BY is_pinned DESC, created_at DESC, uuid DESC LIMIT ? OFFSET ?"
         );
         let date_from = date_from.as_deref();
@@ -2182,7 +2196,8 @@ async fn search_clips_paged(
     // content of an image clip, so a corrupt thumbnail only surfaces now), so
     // the page is filled with readable rows rather than trimmed after the fact.
     let source_start = source_start_for_ids(&matching, after_id.as_deref(), requested_offset);
-    let clips = collect_readable_clips_by_id(db, &matching, source_start, requested_limit).await?;
+    let clips = collect_readable_clips_by_id(db, &matching, source_start, requested_limit, true)
+        .await?;
     let sql_ms = sql_started.elapsed().as_millis();
 
     let image_rows = clips

@@ -197,7 +197,7 @@ fn record_loop(c:&Recording,path:&Path,format:&str,fps:u32)->Result<RawVideo,Str
     Ok(RawVideo{path:path.to_path_buf(),thumbnail,duration:elapsed.as_millis() as u64})
 }
 #[tauri::command]pub fn pause_recording(paused:bool){if let Some(Session::Record(r))=session().lock().unwrap().as_ref(){r.pause.store(paused,Ordering::Release);}}
-async fn table(db:&Database)->Result<(),String>{sqlx::query("CREATE TABLE IF NOT EXISTS capture_recordings(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,path TEXT NOT NULL,thumbnail BLOB NOT NULL,width INTEGER NOT NULL,height INTEGER NOT NULL,duration INTEGER NOT NULL,format TEXT NOT NULL)").execute(&db.pool).await.map_err(|e|e.to_string())?;Ok(())}
+pub(crate) async fn ensure_recordings_table(db:&Database)->Result<(),String>{sqlx::query("CREATE TABLE IF NOT EXISTS capture_recordings(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,path TEXT NOT NULL,thumbnail BLOB NOT NULL,width INTEGER NOT NULL,height INTEGER NOT NULL,duration INTEGER NOT NULL,format TEXT NOT NULL)").execute(&db.pool).await.map_err(|e|e.to_string())?;Ok(())}
 #[tauri::command]pub async fn finish_recording(app:AppHandle,db:tauri::State<'_,Arc<Database>>)->Result<String,String>{
     let c={let g=session().lock().unwrap();match g.as_ref(){Some(Session::Record(r))=>r.clone(),_=>return Err("No recording".into())}};
     c.stop.store(true,Ordering::Release);
@@ -209,7 +209,7 @@ async fn table(db:&Database)->Result<(),String>{sqlx::query("CREATE TABLE IF NOT
         *c.result.lock().unwrap()=Some(raw.clone());raw
     };
     let id=uuid::Uuid::new_v4().to_string();let target=root()?.join(format!("{id}.zxrec"));
-    seal_file(&db,&raw.path,&target)?;table(&db).await?;
+    seal_file(&db,&raw.path,&target)?;ensure_recordings_table(&db).await?;
     sqlx::query("INSERT INTO capture_recordings VALUES(?,?,?,?,?,?,?,?)").bind(&id).bind(chrono::Utc::now().to_rfc3339()).bind(target.to_string_lossy().as_ref()).bind(db.crypto.encrypt(&raw.thumbnail)?).bind(c.region.width).bind(c.region.height).bind(raw.duration as i64).bind(&c.format).execute(&db.pool).await.map_err(|e|e.to_string())?;
     *session().lock().unwrap()=None;RESTORE_WORKFLOW_SETTINGS.store(false,Ordering::Release);let _=app.emit("clipboard-change",serde_json::json!({"source":"recording"}));if let Some(w)=app.get_webview_window("workflow"){let _=w.destroy();}
     crate::commands::open_settings_section(app,"captures".into()).await?;Ok(id)
@@ -219,13 +219,9 @@ fn seal_file(db:&Database,source:&Path,target:&Path)->Result<(),String>{
     let mut out=std::io::BufWriter::new(std::fs::File::create(target).map_err(|e|e.to_string())?);out.write_all(b"ZXREC01").and_then(|_|out.write_all(&length.to_le_bytes())).map_err(|e|e.to_string())?;
     let mut buffer=vec![0u8;1024*1024];loop{let n=source.read(&mut buffer).map_err(|e|e.to_string())?;if n==0{break;}let encrypted=db.crypto.encrypt(&buffer[..n])?;out.write_all(&(encrypted.len() as u32).to_le_bytes()).and_then(|_|out.write_all(&encrypted)).map_err(|e|e.to_string())?;}out.flush().map_err(|e|e.to_string())
 }
-pub async fn recording_entries(db:&Database)->Result<Vec<crate::capture_history::CaptureEntry>,String>{
-    use sqlx::Row;table(db).await?;let rows=sqlx::query("SELECT * FROM capture_recordings ORDER BY created_at DESC").fetch_all(&db.pool).await.map_err(|e|e.to_string())?;
-    rows.into_iter().map(|r|Ok(crate::capture_history::CaptureEntry{id:r.get("id"),thumbnail:format!("data:image/png;base64,{}",B64.encode(db.crypto.decrypt(&r.get::<Vec<u8>,_>("thumbnail"))?)),created_at:r.get("created_at"),width:r.get::<i64,_>("width") as u32,height:r.get::<i64,_>("height") as u32,kind:"recording".into(),pinned:false})).collect()
-}
 #[tauri::command]pub async fn export_recording(app:AppHandle,db:tauri::State<'_,Arc<Database>>,id:String)->Result<Option<String>,String>{
     use sqlx::Row;use tauri_plugin_dialog::DialogExt;
-    table(&db).await?;let row=sqlx::query("SELECT path,format FROM capture_recordings WHERE id=?").bind(&id).fetch_one(&db.pool).await.map_err(|e|e.to_string())?;let format:String=row.get("format");
+    ensure_recordings_table(&db).await?;let row=sqlx::query("SELECT path,format FROM capture_recordings WHERE id=?").bind(&id).fetch_one(&db.pool).await.map_err(|e|e.to_string())?;let format:String=row.get("format");
     let path:PathBuf=std::fs::canonicalize(row.get::<String,_>("path")).map_err(|e|e.to_string())?;if !path.starts_with(std::fs::canonicalize(root()?).map_err(|e|e.to_string())?){return Err("Recording is outside managed storage".into());}
     let ext=format.clone();let chosen=tauri::async_runtime::spawn_blocking(move||app.dialog().file().add_filter("Video",&[ext.as_str()]).set_file_name(format!("Zhenxia-{}.{}",chrono::Local::now().format("%Y%m%d-%H%M%S"),ext)).blocking_save_file()).await.map_err(|e|e.to_string())?;
     let Some(chosen)=chosen else{return Ok(None)};let output=chosen.into_path().map_err(|e|e.to_string())?;
@@ -234,7 +230,7 @@ pub async fn recording_entries(db:&Database)->Result<Vec<crate::capture_history:
     while remaining>0{let mut length=[0;4];input.read_exact(&mut length).map_err(|e|e.to_string())?;let length=u32::from_le_bytes(length) as usize;if length>1_048_704{return Err("Invalid recording chunk".into());}let mut bytes=vec![0;length];input.read_exact(&mut bytes).map_err(|e|e.to_string())?;let plain=db.crypto.decrypt(&bytes)?;if plain.len() as u64>remaining{return Err("Invalid recording length".into());}out.write_all(&plain).map_err(|e|e.to_string())?;remaining-=plain.len() as u64;}
     out.flush().map_err(|e|e.to_string())?;Ok(Some(output.to_string_lossy().into()))
 }
-pub async fn clear_recordings(db:&Database)->Result<usize,String>{use sqlx::Row;table(db).await?;let rows=sqlx::query("SELECT path FROM capture_recordings").fetch_all(&db.pool).await.map_err(|e|e.to_string())?;let root=std::fs::canonicalize(root()?).map_err(|e|e.to_string())?;for row in &rows{if let Ok(p)=std::fs::canonicalize(row.get::<String,_>("path")){if p.starts_with(&root){std::fs::remove_file(p).map_err(|e|e.to_string())?;}}}sqlx::query("DELETE FROM capture_recordings").execute(&db.pool).await.map_err(|e|e.to_string())?;Ok(rows.len())}
+pub async fn clear_recordings(db:&Database)->Result<usize,String>{use sqlx::Row;ensure_recordings_table(db).await?;let rows=sqlx::query("SELECT path FROM capture_recordings").fetch_all(&db.pool).await.map_err(|e|e.to_string())?;let root=std::fs::canonicalize(root()?).map_err(|e|e.to_string())?;for row in &rows{if let Ok(p)=std::fs::canonicalize(row.get::<String,_>("path")){if p.starts_with(&root){std::fs::remove_file(p).map_err(|e|e.to_string())?;}}}sqlx::query("DELETE FROM capture_recordings").execute(&db.pool).await.map_err(|e|e.to_string())?;Ok(rows.len())}
 
 #[tauri::command]pub async fn start_workflow_capture(app:AppHandle,kind:String)->Result<(),String>{if !["scroll","record"].contains(&kind.as_str()){return Err("Unknown workflow".into());}if !available(){return Err("Finish the active capture first".into());}crate::zhenxia::start_screenshot_with_intent(app,kind).await}
 #[tauri::command]pub async fn start_presentation(app:AppHandle)->Result<(),String>{

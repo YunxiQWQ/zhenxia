@@ -15,17 +15,223 @@ pub(crate) async fn image_bytes(db:&Database,id:&str)->Result<Vec<u8>,String>{
 }
 
 #[tauri::command]
-pub async fn list_capture_history(db:tauri::State<'_,Arc<Database>>,offset:Option<u32>,limit:Option<u32>)->Result<Vec<CaptureEntry>,String>{
-    let rows=sqlx::query("SELECT uuid,metadata,created_at,is_pinned FROM clips WHERE clip_type='image' AND is_deleted=0 AND is_hidden=0 AND metadata IS NOT NULL ORDER BY created_at DESC,id DESC").fetch_all(&db.pool).await.map_err(|e|e.to_string())?;
-    let mut entries=Vec::new();let offset=offset.unwrap_or(0);let limit=limit.unwrap_or(60).clamp(1,120);
+pub async fn list_capture_history(
+    db: tauri::State<'_, Arc<Database>>,
+    offset: Option<u32>,
+    limit: Option<u32>,
+    kind: Option<String>,
+    query: Option<String>,
+) -> Result<Vec<CaptureEntry>, String> {
+    list_capture_page(
+        &db,
+        offset.unwrap_or(0) as usize,
+        limit.unwrap_or(18).clamp(1, 120) as usize,
+        kind.as_deref().unwrap_or("all"),
+        query.as_deref().unwrap_or("").trim(),
+    )
+    .await
+}
+
+async fn list_capture_page(
+    db: &Database,
+    offset: usize,
+    limit: usize,
+    kind: &str,
+    query: &str,
+) -> Result<Vec<CaptureEntry>, String> {
+    crate::workflows::ensure_recordings_table(db).await?;
+    // Sort only metadata. The two sources store UTC timestamps in different
+    // formats, so textual comparison would put all recordings above every
+    // screenshot from the same date.
+    let rows = sqlx::query(
+        "SELECT * FROM (
+            SELECT uuid AS id, metadata, created_at, is_pinned, 0 AS recording,
+                   0 AS width, 0 AS height, julianday(created_at) AS sort_time
+            FROM clips
+            WHERE ?1 != 'recording' AND clip_type = 'image'
+                AND is_deleted = 0 AND is_hidden = 0 AND metadata IS NOT NULL
+            UNION ALL
+            SELECT id, NULL, created_at, 0, 1, width, height, julianday(created_at)
+            FROM capture_recordings WHERE ?1 != 'screenshot'
+        ) ORDER BY sort_time DESC, recording DESC, id DESC",
+    )
+    .bind(kind)
+    .fetch_all(&db.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut entries = Vec::with_capacity(limit);
+    let mut skip = offset;
     for row in rows {
-        let Some(metadata)=screenshot_metadata(&db,row.get("metadata")) else{continue};
-        let id:String=row.get("uuid");let content:Vec<u8>=sqlx::query_scalar("SELECT content FROM clips WHERE uuid=?").bind(&id).fetch_one(&db.pool).await.map_err(|e|e.to_string())?;let preview=db.crypto.decrypt(&content)?;
-        let dimensions=metadata.get("width").and_then(|v|v.as_u64()).zip(metadata.get("height").and_then(|v|v.as_u64())).map(|(w,h)|(w as u32,h as u32));
-        let (width,height)=if let Some(size)=dimensions{size}else{let png=image_bytes(&db,&id).await?;image::io::Reader::with_format(std::io::Cursor::new(png),image::ImageFormat::Png).into_dimensions().map_err(|e|e.to_string())?};
-        entries.push(CaptureEntry{id,thumbnail:format!("data:image/png;base64,{}",B64.encode(preview)),created_at:row.get("created_at"),width,height,kind:"screenshot".into(),pinned:row.get("is_pinned")});
-        if entries.len()>=(offset+limit) as usize{break;}
-    }entries.extend(crate::workflows::recording_entries(&db).await?);entries.sort_by(|a,b|b.created_at.cmp(&a.created_at));Ok(entries.into_iter().skip(offset as usize).take(limit as usize).collect())
+        let recording: bool = row.get("recording");
+        let metadata = if recording {
+            None
+        } else {
+            let Some(metadata) = screenshot_metadata(db, row.get("metadata")) else {
+                continue;
+            };
+            Some(metadata)
+        };
+        let id: String = row.get("id");
+        let created_at: String = row.get("created_at");
+        let search_size = !query.is_empty() && !created_at.contains(query);
+        // Pages without a size filter can skip older rows without opening their
+        // original images even when their metadata predates stored dimensions.
+        if skip > 0 && !search_size {
+            skip -= 1;
+            continue;
+        }
+        let (width, height) = if recording {
+            (row.get::<i64, _>("width") as u32, row.get::<i64, _>("height") as u32)
+        } else {
+            let saved_size = metadata.as_ref().and_then(|value| {
+                let width = u32::try_from(value.get("width")?.as_u64()?).ok()?;
+                let height = u32::try_from(value.get("height")?.as_u64()?).ok()?;
+                (width > 0 && height > 0).then_some((width, height))
+            });
+            match saved_size {
+                Some(size) => size,
+                None => image_bytes(db, &id)
+                    .await
+                    .ok()
+                    .and_then(|png| png_dimensions(&png))
+                    .unwrap_or_default(),
+            }
+        };
+        if search_size && !format!("{created_at} {width}×{height}").contains(query) {
+            continue;
+        }
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        entries.push(CaptureEntry {
+            id,
+            thumbnail: String::new(),
+            created_at,
+            width,
+            height,
+            kind: if recording { "recording" } else { "screenshot" }.into(),
+            pinned: row.get("is_pinned"),
+        });
+        if entries.len() == limit {
+            break;
+        }
+    }
+
+    load_thumbnails(db, &mut entries, "screenshot").await?;
+    load_thumbnails(db, &mut entries, "recording").await?;
+    Ok(entries)
+}
+
+fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
+    image::io::Reader::with_format(std::io::Cursor::new(png), image::ImageFormat::Png)
+        .into_dimensions()
+        .ok()
+}
+
+async fn load_thumbnails(
+    db: &Database,
+    entries: &mut [CaptureEntry],
+    kind: &str,
+) -> Result<(), String> {
+    let mut page: Vec<_> = entries.iter_mut().filter(|entry| entry.kind == kind).collect();
+    if page.is_empty() {
+        return Ok(());
+    }
+    let mut sql = sqlx::QueryBuilder::new(if kind == "recording" {
+        "SELECT id, thumbnail FROM capture_recordings WHERE id IN ("
+    } else {
+        "SELECT uuid, content FROM clips WHERE is_deleted = 0 AND is_hidden = 0 AND uuid IN ("
+    });
+    {
+        let mut ids = sql.separated(", ");
+        for entry in &page {
+            ids.push_bind(&entry.id);
+        }
+    }
+    sql.push(")");
+    let thumbnails = sql.build_query_as::<(String, Vec<u8>)>()
+        .fetch_all(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    drop(sql);
+    let mut thumbnails: std::collections::HashMap<_, _> = thumbnails.into_iter().collect();
+    for entry in &mut page {
+        let Some(preview) = thumbnails.remove(&entry.id).and_then(|bytes| db.crypto.decrypt(&bytes).ok()) else {
+            continue;
+        };
+        if entry.width == 0 || entry.height == 0 {
+            (entry.width, entry.height) = png_dimensions(&preview).unwrap_or_default();
+        }
+        entry.thumbnail = format!("data:image/png;base64,{}", B64.encode(preview));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn capture_pages_merge_timestamps_and_survive_a_damaged_thumbnail() {
+        let db = Database {
+            pool: SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+            crypto: Arc::new(crate::crypto::CryptoManager::ephemeral()),
+            image_dir: PathBuf::new(),
+            search_index: Default::default(),
+        };
+        db.migrate().await.unwrap();
+        crate::workflows::ensure_recordings_table(&db).await.unwrap();
+        let preview = db.crypto.encrypt(b"thumbnail bytes").unwrap();
+        let metadata = db
+            .crypto
+            .encrypt_text(r#"{"kind":"screenshot","width":1920,"height":1080}"#)
+            .unwrap();
+        for (id, time, thumbnail, hidden) in [
+            ("recent", "2026-11-20 12:03:00", &preview[..], false),
+            ("damaged", "2026-11-20 12:02:00", &b"bad cipher"[..], false),
+            ("hidden", "2026-11-20 12:05:00", &preview[..], true),
+        ] {
+            sqlx::query("INSERT INTO clips (uuid,clip_type,content,content_hash,metadata,created_at,is_hidden,full_image_expired) VALUES (?,'image',?,?,?,?,?,1)")
+                .bind(id)
+                .bind(thumbnail)
+                .bind(id)
+                .bind(&metadata)
+                .bind(time)
+                .bind(hidden)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO capture_recordings VALUES ('movie','2026-11-20T12:02:30+00:00','',?,1280,720,1000,'mp4')")
+            .bind(&preview)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let first = list_capture_page(&db, 0, 2, "all", "").await.unwrap();
+        assert_eq!(first.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["recent", "movie"]);
+        assert!(first[0].thumbnail.starts_with("data:image/png;base64,"));
+
+        let next = list_capture_page(&db, 2, 2, "all", "").await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].id, "damaged");
+        assert!(next[0].thumbnail.is_empty());
+
+        let matches = list_capture_page(&db, 0, 2, "screenshot", "1920×1080")
+            .await
+            .unwrap();
+        assert_eq!(matches.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["recent", "damaged"]);
+        let movies = list_capture_page(&db, 0, 2, "recording", "2026-11-20").await.unwrap();
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].id, "movie");
+    }
 }
 
 #[tauri::command]

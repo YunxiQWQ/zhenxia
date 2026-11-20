@@ -488,6 +488,15 @@ impl Database {
             "ALTER TABLE clips ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0",
         )
         .await?;
+
+        // Ordinary history pages can walk the visible rows in display order
+        // and stop at the limit without sorting large image records.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_clips_live_history_order
+             ON clips(is_pinned DESC, created_at DESC, uuid DESC) WHERE is_deleted = 0",
+        )
+        .execute(&self.pool)
+        .await?;
         // Encrypted OCR text extracted from screenshot/image clips, so images are
         // findable by their words. NULL until (or unless) OCR runs for a clip.
         add_column_if_missing(&self.pool, "ALTER TABLE clips ADD COLUMN ocr_text TEXT").await?;

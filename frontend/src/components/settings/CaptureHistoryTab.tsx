@@ -6,6 +6,9 @@ import { toast } from 'sonner';
 import { useTranslation } from '../../i18n';
 import { ConfirmDialog } from '../ConfirmDialog';
 import { PaneHeader, Segmented, ghostButton } from './ui';
+
+const PAGE_SIZE = 18;
+
 interface Entry {
   id: string;
   thumbnail: string;
@@ -21,44 +24,64 @@ export function CaptureHistoryTab({ active }: { active: boolean }) {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [kind, setKind] = useState('all');
   const [query, setQuery] = useState('');
+  const [filterQuery, setFilterQuery] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [confirm, setConfirm] = useState(false);
   const [more, setMore] = useState(false);
   const entriesRef = useRef<Entry[]>([]);
   const loadVersion = useRef(0);
+  const filterRef = useRef('');
+  useEffect(() => {
+    const timer = window.setTimeout(() => setFilterQuery(query.trim()), 150);
+    return () => window.clearTimeout(timer);
+  }, [query]);
   const load = useCallback(async (append = false) => {
     const version = ++loadVersion.current;
+    const filterKey = JSON.stringify([kind, filterQuery]);
+    if (filterRef.current !== filterKey) {
+      filterRef.current = filterKey;
+      entriesRef.current = [];
+      setEntries([]);
+      setMore(false);
+    }
     setBusy(true);
     setError('');
     try {
       const page = await invoke<Entry[]>('list_capture_history', {
         offset: append ? entriesRef.current.length : 0,
-        limit: 60,
+        limit: PAGE_SIZE,
+        kind,
+        query: filterQuery,
       });
       if (version !== loadVersion.current) return;
       const next = append ? [...entriesRef.current, ...page] : page;
       entriesRef.current = next;
       setEntries(next);
-      setMore(page.length === 60);
+      setMore(page.length === PAGE_SIZE);
     } catch (e) {
       if (version === loadVersion.current) setError(String(e));
     } finally {
       if (version === loadVersion.current) setBusy(false);
     }
-  }, []);
+  }, [kind, filterQuery]);
   useEffect(() => {
     if (!active) return;
     void load();
-    const off = listen('clipboard-change', () => void load());
+    let closed = false;
+    const off = listen('clipboard-change', () => {
+      if (!closed) void load();
+    });
     return () => {
+      closed = true;
+      ++loadVersion.current;
       void off.then((f) => f()).catch(() => undefined);
     };
   }, [active, load]);
   const visible = entries.filter(
     (e) =>
       (kind === 'all' || e.kind === kind) &&
-      (!query || `${e.created_at} ${e.width}×${e.height}`.includes(query))
+      (!filterQuery || `${e.created_at} ${e.width}×${e.height}`.includes(filterQuery))
   );
   const open = (id: string) =>
     invoke('open_image_window', { id }).catch((e) => toast.error(String(e)));
@@ -120,7 +143,9 @@ export function CaptureHistoryTab({ active }: { active: boolean }) {
               className="overflow-hidden rounded-xl border border-border bg-card/40"
             >
               <img
-                src={e.thumbnail}
+                src={e.thumbnail || undefined}
+                loading="lazy"
+                decoding="async"
                 alt={text('录屏预览', 'Recording preview')}
                 className="h-[112px] w-full object-contain"
               />
@@ -152,7 +177,9 @@ export function CaptureHistoryTab({ active }: { active: boolean }) {
                 onClick={() => void open(e.id)}
               >
                 <img
-                  src={e.thumbnail}
+                  src={e.thumbnail || undefined}
+                  loading="lazy"
+                  decoding="async"
                   alt={`${e.width}×${e.height}`}
                   className="h-full w-full object-contain"
                 />

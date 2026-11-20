@@ -32,6 +32,8 @@ import { shouldRenderClipRowNote } from '../utils/clipRowPresentation';
 interface ClipCardProps {
   /** Pause thumbnail decoding and relative-time updates while the panel is hidden. */
   active?: boolean;
+  /** Mount the image only when this row is in or near the scroll viewport. */
+  loadThumbnail?: boolean;
   clip: ClipboardItem;
   density: 'compact' | 'comfortable';
   isSelected: boolean;
@@ -97,6 +99,7 @@ export const ClipCard = memo(function ClipCard({
   isChecked = false,
   onToggleSelect,
   active = true,
+  loadThumbnail = true,
 }: ClipCardProps) {
   const { lang } = useTranslation();
   // A hidden row arrives carrying no content. Once revealed for the session the
@@ -109,10 +112,12 @@ export const ClipCard = memo(function ClipCard({
     ? { ...row, content: revealed.content, preview: revealed.preview, notes: revealed.notes }
     : row;
   const isHidden = (row.is_hidden ?? false) && !revealed;
+  const isImage = clip.clip_type === 'image';
 
   const imageSrc = useMemo(
-    () => (active && clip.clip_type === 'image' ? imageSrcFromContent(clip.content) : null),
-    [active, clip.clip_type, clip.content]
+    () =>
+      active && loadThumbnail && isImage && !isHidden ? imageSrcFromContent(clip.content) : null,
+    [active, loadThumbnail, isImage, isHidden, clip.content]
   );
 
   // Ticks every 15s so the relative time stays current while the flyout is open.
@@ -128,11 +133,10 @@ export const ClipCard = memo(function ClipCard({
   }, [clip.created_at, timeTick, lang]);
 
   const label = sourceLabel(clip.source_app, clip.clip_type);
-  const preview = normalizePreviewText(clip.content || clip.preview);
+  const preview = isImage ? '' : normalizePreviewText(clip.content || clip.preview);
   const imageMetadata = useMemo(() => parseImageMetadata(clip.metadata), [clip.metadata]);
-  const kind = imageMetadata.formats?.some((format) => format === 'html' || format === 'rtf')
-    ? 'Rich text'
-    : contentKind(preview, clip.clip_type);
+  const richText = imageMetadata.formats?.some((format) => format === 'html' || format === 'rtf');
+  const kind = isImage ? null : richText ? 'Rich text' : contentKind(preview, clip.clip_type);
   const imageDetails = [
     imageMetadata.width && imageMetadata.height
       ? `${imageMetadata.width}×${imageMetadata.height}`
@@ -151,6 +155,7 @@ export const ClipCard = memo(function ClipCard({
     <article
       data-el="clip-card"
       data-clip-id={clip.id}
+      data-clip-type={clip.clip_type}
       data-selected={isSelected}
       // The list is single-select and keyboard-navigated, so option/aria-selected
       // is what conveys the selection. aria-current on a listitem does not: a
@@ -174,7 +179,7 @@ export const ClipCard = memo(function ClipCard({
           onToggleSelect(event);
           return;
         }
-        if (clip.clip_type === 'image' && !selectable) {
+        if (isImage && !selectable) {
           void invoke('open_image_window', { id: clip.id }).catch(console.error);
           return;
         }
@@ -237,9 +242,11 @@ export const ClipCard = memo(function ClipCard({
           <img
             src={`data:image/png;base64,${clip.source_icon}`}
             alt=""
+            loading="lazy"
+            decoding="async"
             className="h-[18px] w-[18px] object-contain"
           />
-        ) : clip.clip_type === 'image' ? (
+        ) : isImage ? (
           <ImageIcon size={16} className="text-muted-foreground" />
         ) : (
           <File size={15} className="text-muted-foreground" />
@@ -270,7 +277,7 @@ export const ClipCard = memo(function ClipCard({
               )}
             </div>
           </>
-        ) : clip.clip_type === 'image' ? (
+        ) : isImage ? (
           <div className="flex min-w-0 items-center gap-3">
             <div
               className={clsx(
@@ -293,6 +300,7 @@ export const ClipCard = memo(function ClipCard({
                   <img
                     src={imageSrc}
                     alt=""
+                    decoding="async"
                     className={clsx(
                       'h-full w-full object-cover',
                       clip.image_expired && 'opacity-60'
@@ -316,6 +324,7 @@ export const ClipCard = memo(function ClipCard({
                 <img
                   src={imageSrc}
                   alt=""
+                  decoding="async"
                   className={clsx('h-full w-full object-cover', clip.image_expired && 'opacity-60')}
                 />
               )}

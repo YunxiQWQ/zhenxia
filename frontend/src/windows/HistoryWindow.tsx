@@ -55,6 +55,7 @@ interface SourceAppCount {
   count: number;
 }
 
+const FIRST_PAGE_SIZE = 10;
 const PAGE_SIZE = 20;
 
 const bulkActionClass =
@@ -128,6 +129,9 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
   const pageCursorRef = useRef<string | null>(null);
   const selectedFolderRef = useRef(selectedFolder);
   selectedFolderRef.current = selectedFolder;
+  const filtersOpenRef = useRef(filtersOpen);
+  filtersOpenRef.current = filtersOpen;
+  const blurredWhileOpen = useRef(false);
   // Guards against an older load landing after a newer one and restoring stale
   // results — the same discipline the flyout uses.
   const loadIdRef = useRef(0);
@@ -192,11 +196,6 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
   const loadClips = useCallback(
     async (append: boolean): Promise<ClipLoadResult> => {
       const loadId = ++loadIdRef.current;
-      const page = clipListPageArgs(
-        { loadedCount: clipsRef.current.length, cursorId: pageCursorRef.current },
-        append,
-        PAGE_SIZE
-      );
       const query = searchQuery.trim();
       const filterKey = JSON.stringify([
         selectedFolder,
@@ -206,6 +205,17 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         dateTo,
         sourceApp,
       ]);
+      const loadedCount = clipsRef.current.length;
+      // A compact initial page fills the viewport. Keep the usual refresh
+      // size once the user has paged through the same query and may be using
+      // one of those rows in the details pane.
+      const alreadyPaged =
+        visibleFilterKeyRef.current === filterKey && loadedCount > FIRST_PAGE_SIZE;
+      const page = clipListPageArgs(
+        { loadedCount, cursorId: pageCursorRef.current },
+        append,
+        append || alreadyPaged ? PAGE_SIZE : FIRST_PAGE_SIZE
+      );
 
       try {
         setIsLoading(true);
@@ -238,7 +248,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
         setClips((previous) => (append ? [...previous, ...data] : data));
         pageCursorRef.current = nextPageCursor(data, append ? pageCursorRef.current : null);
         visibleFilterKeyRef.current = filterKey;
-        setHasMore(data.length === PAGE_SIZE);
+        setHasMore(data.length === page.limit);
         setLoadError(false);
         return 'applied';
       } catch (error) {
@@ -298,6 +308,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
   }, []);
 
   const loadSourceApps = useCallback(async () => {
+    if (!filtersOpenRef.current) return true;
     try {
       setSourceApps(await invoke<SourceAppCount[]>('get_source_apps'));
       return true;
@@ -328,6 +339,7 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
   useEffect(() => {
     if (!active) {
       // Keep selection and drafts, but discard any pending hidden-list response.
+      blurredWhileOpen.current = false;
       ++loadIdRef.current;
       return;
     }
@@ -346,51 +358,47 @@ export function HistoryWindow({ active = true }: { active?: boolean }) {
     if (!active) return;
     loadFolders();
     refreshTotalCount();
-    loadSourceApps();
-  }, [active, loadFolders, refreshTotalCount, loadSourceApps]);
+  }, [active, loadFolders, refreshTotalCount]);
 
-  // Keep the window live while it sits open next to the flyout: a copy made
-  // anywhere shows up here without a manual refresh.
+  useEffect(() => {
+    if (active && filtersOpen) void loadSourceApps();
+  }, [active, filtersOpen, loadSourceApps]);
+
   useEffect(() => {
     if (!active) return;
-    const unlistenClipboard = listen('clipboard-change', () => {
-      void (async () => {
-        const previous = selectedFolderRef.current;
-        await loadFolders();
-        if (selectedFolderRef.current === previous) {
-          loadClips(false);
-        }
-        refreshTotalCount();
-        // A new clip can introduce an app, or move one up the list.
-        loadSourceApps();
-      })();
-    });
+    let disposed = false;
+    const refresh = async () => {
+      if (disposed) return;
+      const previous = selectedFolderRef.current;
+      await loadFolders();
+      if (disposed) return;
+      if (selectedFolderRef.current === previous) void loadClips(false);
+      void refreshTotalCount();
+      void loadSourceApps();
+    };
+    const unlistenClipboard = listen('clipboard-change', () => void refresh());
     const unlistenOcr = listen<string>('ocr-completed', (event) => {
       setClips((previous) =>
         previous.map((clip) => (clip.id === event.payload ? { ...clip, has_ocr_text: true } : clip))
       );
     });
-    // Deleting or pinning from the flyout or tray emits no event this window
-    // hears, so it would keep listing clips that are already gone and fail on
-    // the next action against one. Refreshing when the window is focused again
-    // catches every such change without a new cross-window event contract.
-    const refreshOnFocus = () => {
-      if (document.documentElement.dataset.captureMode === 'true') return;
-      void (async () => {
-        const previous = selectedFolderRef.current;
-        await loadFolders();
-        if (selectedFolderRef.current === previous) {
-          loadClips(false);
-        }
-        refreshTotalCount();
-        // Deleting elsewhere can empty out an app, changing its count or dropping
-        // it from the filter list entirely.
-        loadSourceApps();
-      })();
+    // Activation already refreshes the list. Only focus returning to a panel
+    // that stayed open (for example after settings) needs its own refresh.
+    const noteBlur = () => {
+      blurredWhileOpen.current = true;
     };
+    const refreshOnFocus = () => {
+      if (!blurredWhileOpen.current || document.documentElement.dataset.captureMode === 'true')
+        return;
+      blurredWhileOpen.current = false;
+      void refresh();
+    };
+    window.addEventListener('blur', noteBlur);
     window.addEventListener('focus', refreshOnFocus);
 
     return () => {
+      disposed = true;
+      window.removeEventListener('blur', noteBlur);
       window.removeEventListener('focus', refreshOnFocus);
       unlistenClipboard.then((dispose) => dispose()).catch(() => undefined);
       unlistenOcr.then((dispose) => dispose()).catch(() => undefined);

@@ -55,6 +55,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   delete document.documentElement.dataset.captureMode;
 });
 const open = async () => {
@@ -213,6 +214,95 @@ describe('unified Win+V history keyboard contract', () => {
 });
 
 describe('compact Cubby history', () => {
+  it('requests a short first page and decodes only image rows near the viewport', async () => {
+    const images = Array.from({ length: 30 }, (_, index) => ({
+      ...fixture,
+      id: `image-${index}`,
+      clip_type: 'image',
+      content: 'data:image/png;base64,aW1hZ2U=',
+    }));
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === 'get_settings') return { has_completed_onboarding: true };
+      if (command === 'get_clips') {
+        const limit = args && 'limit' in args ? Number(args.limit) : 0;
+        const offset = args && 'offset' in args ? Number(args.offset) : 0;
+        return images.slice(offset, offset + limit);
+      }
+      if (command === 'get_clipboard_history_size') return images.length;
+      if (command === 'get_folders' || command === 'get_source_apps') return [];
+      return null;
+    });
+
+    let notify: (entries: IntersectionObserverEntry[]) => void = () => {};
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        observe = observe;
+        disconnect = disconnect;
+        constructor(callback: IntersectionObserverCallback) {
+          notify = (entries) => callback(entries, this as unknown as IntersectionObserver);
+        }
+      }
+    );
+
+    const { container, rerender } = render(<HistoryWindow />);
+    await waitFor(() => expect(observe).toHaveBeenCalledTimes(10));
+    expect(invoke).toHaveBeenCalledWith('get_clips', expect.objectContaining({ limit: 10 }));
+    const list = container.querySelector('[data-el="clip-list"]')!;
+    const first = list.querySelector('[data-clip-id="image-0"]')!;
+    const later = list.querySelector('[data-clip-id="image-9"]')!;
+    const entry = (target: Element, isIntersecting: boolean) =>
+      ({ target, isIntersecting }) as IntersectionObserverEntry;
+    act(() => notify([entry(first, true)]));
+    expect(first.querySelector('img')).toHaveAttribute('src', images[0].content);
+    expect(later.querySelector('img')).toBeNull();
+    act(() => notify([entry(first, false), entry(later, true)]));
+    expect(first.querySelector('img')).toBeNull();
+    expect(later.querySelector('img')).toHaveAttribute('src', images[9].content);
+
+    fireEvent.scroll(list);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        'get_clips',
+        expect.objectContaining({ limit: 20, afterId: 'image-9' })
+      )
+    );
+    await waitFor(() => expect(list.querySelectorAll('[role="option"]')).toHaveLength(30));
+    rerender(<HistoryWindow active={false} />);
+    expect(disconnect).toHaveBeenCalled();
+    expect(list.querySelector('img')).toBeNull();
+    rerender(<HistoryWindow active />);
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        'get_clips',
+        expect.objectContaining({ limit: 20, offset: 0 })
+      )
+    );
+  });
+
+  it('fetches the list once on activation and loads app counts when filters are opened', async () => {
+    const { container } = await open();
+    fireEvent.focus(window);
+    expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === 'get_clips')).toHaveLength(1);
+    expect(invoke).not.toHaveBeenCalledWith('get_source_apps');
+
+    const menuButton = container.querySelector('[aria-label="Clipboard history actions"]')!;
+    fireEvent.click(menuButton);
+    const filterAction = Array.from(container.querySelectorAll('[role="menuitem"]')).find((node) =>
+      node.textContent?.toLowerCase().includes('filter')
+    );
+    expect(filterAction).toBeDefined();
+    fireEvent.click(filterAction!);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith('get_source_apps'));
+    fireEvent.blur(window);
+    fireEvent.focus(window);
+    await waitFor(() =>
+      expect(vi.mocked(invoke).mock.calls.filter(([name]) => name === 'get_clips')).toHaveLength(2)
+    );
+  });
+
   it('keeps details and selection controls out of the default list, then opens details on a clip click', async () => {
     const { container } = await open();
     expect(container.querySelector('footer')).toBeNull();

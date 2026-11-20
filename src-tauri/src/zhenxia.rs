@@ -11,7 +11,7 @@ use crate::database::Database;
 use crate::ocr_queue;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use clipboard_rs::common::RustImage;
+use clipboard_rs::common::{RustImage, RustImageData};
 use clipboard_rs::Clipboard as _;
 use image::GenericImageView;
 use lscreen_core::geom::{RectF, P2};
@@ -19,6 +19,7 @@ use lscreen_core::model::{Element, ElementKind, Rgba, Style};
 use lscreen_core::render::Renderer;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -198,18 +199,42 @@ pub async fn copy_pin_image(pin_id: String) -> Result<(), String> {
 pub async fn save_pin_image(app: AppHandle, pin_id: String) -> Result<String, String> {
     let png = pin_payloads().lock().unwrap().get(&pin_id)
         .ok_or_else(|| "Pinned image has been released".to_string())?.png.clone();
-    tauri::async_runtime::spawn_blocking(move || save_png_dialog(&app, &png, "Zhenxia.png")).await.map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || save_image_dialog(&app, &png, "Zhenxia")).await.map_err(|e| e.to_string())?
 }
 
-fn save_png_dialog(app: &AppHandle, png: &[u8], name: &str) -> Result<String, String> {
+fn save_image_dialog(app: &AppHandle, png: &[u8], name: &str) -> Result<String, String> {
     use tauri_plugin_dialog::DialogExt;
-    let mut dialog=app.dialog().file().set_file_name(name).add_filter("PNG", &["png"]);
-    if let Some(parent)=app.webview_windows().into_values().find(|w|w.is_focused().unwrap_or(false)).or_else(||app.get_webview_window("main")){dialog=dialog.set_parent(&parent);}
-    let Some(path) = dialog.blocking_save_file()
-        else { return Err("Save cancelled".into()); };
+    let mut dialog = app.dialog().file().set_file_name(name)
+        .add_filter("PNG", &["png"])
+        .add_filter("JPEG", &["jpg", "jpeg"]);
+    let parent = app.webview_windows().into_values()
+        .find(|window| window.is_focused().unwrap_or(false))
+        .or_else(|| app.get_webview_window(OVERLAY_LABEL));
+    if let Some(parent) = parent {
+        dialog = dialog.set_parent(&parent);
+    }
+    let Some(path) = dialog.blocking_save_file() else {
+        return Err("Save cancelled".into());
+    };
     let path = path.into_path().map_err(|e| e.to_string())?;
-    std::fs::write(&path, png).map_err(|e| e.to_string())?;
+    write_image_export(&path, png)?;
     Ok(path.to_string_lossy().to_string())
+}
+
+fn write_image_export(path: &Path, png: &[u8]) -> Result<(), String> {
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+    let jpeg;
+    let bytes = match extension.to_ascii_lowercase().as_str() {
+        "" | "png" => png,
+        "jpg" | "jpeg" => {
+            jpeg = RustImageData::from_bytes(png)
+                .and_then(|image| image.to_jpeg())
+                .map_err(|e| e.to_string())?;
+            jpeg.get_bytes()
+        }
+        _ => return Err("请选择 PNG 或 JPG / Choose PNG or JPG".into()),
+    };
+    std::fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -882,8 +907,11 @@ pub async fn screenshot_tool_action(app:AppHandle,db:tauri::State<'_,Arc<Databas
         return Ok(serde_json::json!({"codes":codes}));
     }
     if action=="save"{
-        let output=png.clone();let dialog_app=app.clone();
-        let path=tauri::async_runtime::spawn_blocking(move||save_png_dialog(&dialog_app,&output,"Zhenxia.png")).await.map_err(|e|e.to_string())??;
+        let dialog_app = app.clone();
+        let (path, png) = tauri::async_runtime::spawn_blocking(move || {
+            let path = save_image_dialog(&dialog_app, &png, "Zhenxia")?;
+            Ok::<_, String>((path, png))
+        }).await.map_err(|e| e.to_string())??;
         insert_image_history(&app,&db,&png,serde_json::json!({"kind":"screenshot","source":"zhenxia","mode":"save"}),false).await?;
         close_screenshot_window(&app);return Ok(serde_json::json!({"path":path}));
     }
@@ -1045,7 +1073,7 @@ async fn load_clip_png(db: &Database, id: &str) -> Result<Vec<u8>, String> {
 #[tauri::command]
 pub async fn save_clip_image(app: AppHandle, db: tauri::State<'_, Arc<Database>>, id: String) -> Result<String, String> {
     let png = load_clip_png(&db, &id).await?;
-    tauri::async_runtime::spawn_blocking(move || save_png_dialog(&app, &png, "Zhenxia.png")).await.map_err(|e|e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || save_image_dialog(&app, &png, "Zhenxia")).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1070,7 +1098,7 @@ pub async fn export_image_edit(
         return Err("Expected PNG image".into());
     }
     if action == "save" {
-        tauri::async_runtime::spawn_blocking(move || save_png_dialog(&app, &png, "Zhenxia-edited.png"))
+        tauri::async_runtime::spawn_blocking(move || save_image_dialog(&app, &png, "Zhenxia-edited"))
             .await.map_err(|e|e.to_string())??;
         return Ok(());
     }
@@ -1179,25 +1207,37 @@ pub async fn save_screenshot_png(
     image_base64: String,
     suggested_name: Option<String>,
 ) -> Result<String, String> {
-    use tauri_plugin_dialog::DialogExt;
     let bytes = B64.decode(image_base64).map_err(|error| error.to_string())?;
-    let path = app
-        .dialog()
-        .file()
-        .set_file_name(suggested_name.unwrap_or_else(|| "帧匣截图.png".into()))
-        .add_filter("PNG 图片", &["png"])
-        .blocking_save_file();
-    let Some(path) = path else {
-        return Err("已取消保存".into());
-    };
-    let path = path.into_path().map_err(|error| error.to_string())?;
-    std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
-    Ok(path.to_string_lossy().to_string())
+    let name = suggested_name.unwrap_or_else(|| "帧匣截图".into());
+    tauri::async_runtime::spawn_blocking(move || save_image_dialog(&app, &bytes, &name))
+        .await.map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_export_writes_real_jpeg_and_preserves_original_png() {
+        let png = encode_png(16, 10, &[30, 80, 190, 255].repeat(160)).unwrap();
+        let destination = std::env::temp_dir().join(format!("zhenxia-export-{}", Uuid::new_v4()));
+        for extension in ["jpg", "JPEG", "png"] {
+            let path = destination.with_extension(extension);
+            write_image_export(&path, &png).unwrap();
+            let exported = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            if extension == "png" {
+                assert_eq!(exported, png);
+            } else {
+                assert_eq!(image::guess_format(&exported).unwrap(), image::ImageFormat::Jpeg);
+                let decoded = RustImageData::from_bytes(&exported).unwrap();
+                assert_eq!(decoded.get_size(), (16, 10));
+            }
+        }
+        let unsupported = destination.with_extension("webp");
+        assert!(write_image_export(&unsupported, &png).is_err());
+        assert!(!unsupported.exists());
+    }
 
     #[test]
     fn deferred_capture_encoding_preserves_pixels_and_rejects_invalid_buffers() {
